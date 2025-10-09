@@ -1,0 +1,46 @@
+# config/example.yaml
+# 範例：最小可運作的 agent 設定模板
+
+# ===========================
+# Base Client Setup
+# ===========================
+openai: &openai
+  client:
+    api_key: ${oc.env:OPENAI_API_KEY, ''}
+    base_url: https://api.openai.com/v1
+  params:
+    temperature: 0.5
+
+# ===========================
+# Base Instruction Setup
+# ===========================
+instruction: &instruction
+  dynamic_prompt: true
+  dynamic_module_path: path.to.dynamic.prompt.module
+  model_context_path: path.to.model.context
+  instruction_file_path: to/your/md/file/path
+
+# ===========================
+# Base Model Setup
+# ===========================
+models:
+  gpt-41: &model_gpt41
+    <<: *openai
+    model: gpt-4.1
+
+# ===========================
+# Agent Setup (單一範例)
+# ===========================
+agents:
+  example:
+    - example_agent:
+        name: ExampleAgent
+        model_instruction:
+          <<: *instruction
+          dynamic_prompt: false
+          instruction_file_path: ${__dir__}/prompt_files/example_instruction.md
+        model_params:
+          <<: *model_gpt41
+          params:
+            temperature: 0.3
+        output_schema: schema.model_output.example_schema.ExampleOutput
