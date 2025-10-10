@@ -1,0 +1,235 @@
+import time, asyncio, uuid
+
+from functools import wraps
+from collections import defaultdict
+from typing import Any, Dict, Callable, Optional
+
+
+from agents import Agent, OpenAIChatCompletionsModel
+from agents.run_context import RunContextWrapper
+
+from .limits_parameters import global_sem, global_rpm_limiter
+from .token_counter import count_tokens
+from .token_bucket import LimitRegistry
+
+
+def with_global_limits(fn):
+    @wraps(fn)
+    async def wrapped(state, *args, **kwargs):
+        async with global_rpm_limiter:
+            async with global_sem:
+                return await fn(state, *args, **kwargs)
+    return wrapped
+
+async def _wait_with_trace(coro: Callable[[], "asyncio.Future"],
+                           trace: Optional[Callable[[str, Dict[str, Any]], None]],
+                           run_id: str,
+                           stage: str,
+                           warn_after_s: float,
+                           heartbeat_every_s: float):
+    """
+    執行一個等待動作（例如 acquire/rpm/semaphore），
+    若超過 warn_after_s 秒未完成，開始每 heartbeat_every_s 秒打一次 still_waiting 訊息。
+    """
+    start = time.monotonic()
+    warned = False
+    # 啟一個監視器，一旦主動作完成就會被取消
+    done_evt = asyncio.Event()
+
+    async def _heartbeat():
+        nonlocal warned
+        try:
+            while not done_evt.is_set():
+                await asyncio.sleep(heartbeat_every_s)
+                elapsed = time.monotonic() - start
+                if elapsed >= warn_after_s:
+                    warned = True
+                    if trace:
+                        trace("still_waiting", {"run_id": run_id, "stage": stage, "elapsed_s": round(elapsed, 2)})
+        except asyncio.CancelledError:
+            pass
+
+    hb_task = asyncio.create_task(_heartbeat()) if heartbeat_every_s > 0 else None
+    try:
+        result = await coro()
+        return result, time.monotonic() - start, warned
+    finally:
+        done_evt.set()
+        if hb_task:
+            hb_task.cancel()
+
+
+def limits_guard_multi(
+    registry: LimitRegistry,
+    umbrella: Any,                         # NoopUmbrella 或 AdaptiveUmbrella
+    *,
+    agent_arg: str = "agent",
+    input_arg: str = "input",
+    context_arg: str = "context",
+    # —— 預扣參數 —— #
+    max_output_tokens: int = 1024,
+    output_buffer_mult: float = 1.2,
+    safety_pad_tokens: int = 64,
+    per_round_pad: int = 300,              # function/tool-heavy 可拉高（500~800）
+    # ---- 追蹤選項 ----
+    trace: Optional[Callable[[str, Dict[str, Any]], None]] = None,  # trace(event, fields)
+    warn_after_s: float = 15.0,  # 某階段等待超過這個秒數開始心跳
+    heartbeat_every_s: float = 15.0,  # 心跳間隔；設 0 可關閉心跳
+):
+    """
+    只掛在「實際發 API」的方法上（如呼叫 Runner.run 的 gateway）。
+    等待順序：TPM(umbrella→model) → RPM(model) → Semaphore。
+    結束後：按 raw_responses[*].model 逐模型合計 actual，做「低估補扣 / 高估退款」；umbrella 同步校正。
+    """
+    def deco(fn):
+        @wraps(fn)
+        async def wrapped(self, *args, **kwargs):
+            run_id = uuid.uuid4().hex[:8]
+            agent: Agent = getattr(self, agent_arg)
+            model = agent.model
+            if isinstance(model, str):
+                model_name = model
+            elif isinstance(model, OpenAIChatCompletionsModel):
+                model_name = model.model
+            else:
+                model_name = model.__name__
+            user_input = kwargs.get(input_arg, args[0] if args else "")
+            ctx_obj = kwargs.get(context_arg, None)
+            wrapper = RunContextWrapper(context=ctx_obj)
+
+            # 先算 user_tok（不會阻塞）
+            user_tok = count_tokens(str(user_input), model_name)
+
+            t0 = time.monotonic()
+            if trace:
+                trace("enter", {
+                    "run_id": run_id,
+                    "models": [model_name],
+                    "user_tok": user_tok,
+                    "note": "about to build dynamic system"
+                })
+
+            # ★ 用心跳包住「動態 system prompt」這一步
+            async def _build_sys():
+                return await agent.get_system_prompt(wrapper)
+
+            sys_text, sys_wait, _ = await _wait_with_trace(
+                _build_sys, trace, run_id, "build_system", warn_after_s, heartbeat_every_s
+            )
+            if trace:
+                trace("acquired", {"run_id": run_id, "stage": "build_system", "wait_s": round(sys_wait, 2)})
+
+            sys_tok = count_tokens(sys_text, model_name)
+
+            reserved = max(1,
+                           user_tok + sys_tok
+                           + safety_pad_tokens
+                           + int(output_buffer_mult * max_output_tokens)
+                           + per_round_pad
+                           )
+            models = [model_name]
+
+            # 可選：把目前估值也打一下
+            if trace:
+                trace("estimate_ready", {
+                    "run_id": run_id, "reserved_tokens": reserved,
+                    "user_tok": user_tok, "sys_tok": sys_tok
+                })
+
+            # ---- 4) 送出前等待：先 umbrella.TPM，再每模型 TPM，再每模型 RPM，最後併發 ----
+            try:
+                # TPM（umbrella）
+                async def _umb_acq(): await umbrella.acquire(reserved)
+                _, wait_umb, umb_warned = await _wait_with_trace(_umb_acq, trace, run_id, "umbrella_tpm", warn_after_s,
+                                                                 heartbeat_every_s)
+                if trace: trace("acquired", {"run_id": run_id, "stage": "umbrella_tpm", "wait_s": round(wait_umb, 2)})
+                # TPM（每模型）
+                for m in models:
+                    async def _tpm_acq(m=m):
+                        await registry.bucket(m).acquire(reserved)
+
+                    _, w, warned = await _wait_with_trace(_tpm_acq, trace, run_id, f"model_tpm:{m}", warn_after_s,
+                                                          heartbeat_every_s)
+                    if trace: trace("acquired", {"run_id": run_id, "stage": f"model_tpm:{m}", "wait_s": round(w, 2)})
+
+                # RPM（每模型；固定順序避免鎖序競爭）
+                async def _rpm_chain():
+                    for _m in sorted(models):
+                        async with registry.rpm(_m):
+                            pass
+                _, wait_rpm, rpm_warned = await _wait_with_trace(_rpm_chain, trace, run_id, "model_rpm_chain", warn_after_s, heartbeat_every_s)
+                if trace: trace("acquired", {"run_id": run_id, "stage": "model_rpm_chain", "wait_s": round(wait_rpm, 2)})
+
+                # 併發名額（最後拿，拿到就立刻送）
+                async def _sem_and_call():
+                    async with global_sem:
+                        return await fn(self, *args, **kwargs)
+
+                resp, call_time, _ = await _wait_with_trace(lambda: _sem_and_call(), trace, run_id, "inflight_and_call",
+                                                            warn_after_s, heartbeat_every_s)
+                if trace:
+                    trace("sent", {"run_id": run_id, "call_elapsed_s": round(call_time, 2)})
+
+            except Exception:
+                # 出錯：退回已預扣的 TPM
+                for m in models:
+                    try:
+                        await registry.bucket(m).refund(reserved)
+                    except Exception:
+                        pass
+                try:
+                    await umbrella.refund(reserved)
+                except Exception:
+                    pass
+                raise
+
+            # ---- 5) 以 raw_responses 逐模型統計實際 token（涵蓋 function/tool 多回合）----
+            used_by_model: Dict[str, int] = defaultdict(int)
+            total_used = 0
+            raw_list = getattr(resp, "raw_responses", None) or []
+            for r in raw_list:
+                u = getattr(r, "usage", None)
+                tot = 0
+                if u and hasattr(u, "total_tokens"):
+                    tot = int(u.total_tokens)
+                elif isinstance(u, dict) and "total_tokens" in u:
+                    tot = int(u["total_tokens"])
+
+                model_used = getattr(r, "model", None) or getattr(r, "model_name", None)
+                if model_used and tot:
+                    used_by_model[model_used] += tot
+                total_used += tot
+
+            # ---- 6) 校正：低估 → 補扣；高估 → 退款（先模型、後 umbrella）----
+            for m in models:
+                actual = used_by_model.get(m, 0)
+                if actual > reserved:
+                    # 低估：補扣差額（必要時會等待）
+                    await registry.bucket(m).acquire(actual - reserved)
+                    if trace: trace("topup_tpm", {"run_id": run_id, "model": m, "extra_tokens": actual - reserved})
+                elif reserved > actual > 0:
+                    # 高估：退款差額
+                    await registry.bucket(m).refund(reserved - actual)
+                    if trace: trace("refund_tpm", {"run_id": run_id, "model": m, "refund_tokens": reserved - actual})
+
+            if total_used > reserved:
+                await umbrella.acquire(total_used - reserved)
+                if trace: trace("topup_tpm",
+                                {"run_id": run_id, "model": "umbrella", "extra_tokens": total_used - reserved})
+            elif reserved > total_used > 0:
+                await umbrella.refund(reserved - total_used)
+                if trace: trace("refund_tpm",
+                                {"run_id": run_id, "model": "umbrella", "refund_tokens": reserved - total_used})
+
+            if trace:
+                trace("done", {
+                    "run_id": run_id,
+                    "total_elapsed_s": round(time.monotonic() - t0, 2),
+                    "reserved_tokens": reserved,
+                    "actual_total_tokens": total_used,
+                    "used_by_model": dict(used_by_model),
+                })
+
+            return resp
+        return wrapped
+    return deco
