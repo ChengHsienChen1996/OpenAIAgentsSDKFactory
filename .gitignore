@@ -1,1 +1,7 @@
 /.env
+/.idea/inspectionProfiles/profiles_settings.xml
+/.idea/.gitignore
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/openai_agent_sdk_factory.iml
+/.idea/vcs.xml
