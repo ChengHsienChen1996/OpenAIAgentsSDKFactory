@@ -101,8 +101,8 @@ class AgentFactory:
             raise KeyError(f"Agent {name} not registered")
 
 
-Agent_Factory = AgentFactory.create_factory_from_yaml(yaml_settings_path=os.getenv("YAML_SETTINGS_FILE"))
-
+def create_agent_factory() -> AgentFactory:
+    return AgentFactory.create_factory_from_yaml(yaml_settings_path=os.getenv("YAML_SETTINGS_FILE"))
 
 
 def test_factory():
