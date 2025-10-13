@@ -1,1 +1,1 @@
-from utils.rate_limiter.wrappers import with_global_limits, limits_guard_multi
+from .wrappers import with_global_limits, limits_guard_multi
