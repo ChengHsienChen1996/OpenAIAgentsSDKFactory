@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "openai-agent-sdk-factory"
 version = "0.1.0"
@@ -10,3 +14,7 @@ dependencies = [
     "python-dotenv>=1.1.1",
     "tiktoken>=0.12.0",
 ]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["agent_factory*"]   # 打包 agent_factory 及其子套件

@@ -329,7 +329,7 @@ wheels = [
 [[package]]
 name = "openai-agent-sdk-factory"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "aiolimiter" },
     { name = "omegaconf" },
