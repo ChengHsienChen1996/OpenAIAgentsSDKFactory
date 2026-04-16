@@ -50,7 +50,7 @@ class LimitAgentRunner:
     @limits_guard_multi(
         registry=registry,
         umbrella=umbrella,
-        input_arg="input",
+        input_arg="input_",
         context_arg="context",
         max_output_tokens=2048,
         output_buffer_mult=1.2,
@@ -71,5 +71,5 @@ class LimitAgentRunner:
 
     @staticmethod
     def check_if_tool_usage_object(_obj) -> bool:
-        return (isinstance(_obj, ToolCallOutputItem) & isinstance(_obj, ToolCallItem) & isinstance(_obj, MCPApprovalRequestItem)
-                & isinstance(_obj, MCPApprovalResponseItem) & isinstance(_obj, MCPListToolsItem))
+        return isinstance(_obj, (ToolCallOutputItem, ToolCallItem, MCPListToolsItem,
+                                 MCPApprovalRequestItem, MCPApprovalResponseItem))

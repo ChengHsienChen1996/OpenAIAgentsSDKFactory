@@ -64,7 +64,7 @@ def limits_guard_multi(
     umbrella: Any,                         # NoopUmbrella 或 AdaptiveUmbrella
     *,
     agent_arg: str = "agent",
-    input_arg: str = "input",
+    input_arg: str = "input_",
     context_arg: str = "context",
     # —— 預扣參數 —— #
     max_output_tokens: int = 1024,
