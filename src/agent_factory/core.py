@@ -38,12 +38,17 @@ class AgentFactory:
         except KeyError:
             raise KeyError(f"Agent {name} not registered")
 
-    @classmethod
-    def register(cls, name: str):
-        """Decorator，手動將 AgentBuilder 函式註冊到 registry。"""
+    def register(self, name: str):
+        """ 使用方式
+        factory = create_agent_factory()
+
+        @factory.register("CustomAgent")
+        def my_builder(config): ...
+        """
         def decorator(func: _RegistryEntry):
-            cls._registry[name] = func
+            self._registry[name] = func
             return func
+
         return decorator
 
     @classmethod
