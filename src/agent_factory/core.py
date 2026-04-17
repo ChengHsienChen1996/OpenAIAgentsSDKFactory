@@ -15,9 +15,8 @@ AgentBuilder = Callable[[dict], "Agent"]  # 參數是 settings dict
 
 
 class AgentFactory:
-    _registry: Dict[str, AgentBuilder] = {}
-
     def __init__(self, yaml_settings_path: os.PathLike | str):
+        self._registry: Dict[str, AgentBuilder] = {}
         self._settings_file = Path(yaml_settings_path)
         self._file_dir = self._settings_file.parent
 
