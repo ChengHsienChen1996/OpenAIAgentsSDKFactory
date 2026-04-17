@@ -9,6 +9,7 @@ from openai import AsyncOpenAI
 from agents import Agent, ModelSettings, OpenAIChatCompletionsModel
 
 from .agent_utils import *
+from .config_schema import AgentConfig
 
 load_dotenv()
 AgentBuilder = Callable[[dict], "Agent"]  # 參數是 settings dict
@@ -35,6 +36,14 @@ class AgentFactory:
         for agent_type, agents in settings.agents.items():
             for agent in agents:
                 agent_name, agent_settings = tuple(agent.items())[0]
+                try:
+                    AgentConfig.model_validate(
+                        OmegaConf.to_container(agent_settings, resolve=True)
+                    )
+                except Exception as exc:
+                    raise ValueError(
+                        f"Agent '{agent_name}' 設定驗證失敗：{exc}"
+                    ) from exc
                 self._registry[agent_name] = self.create_agent(agent_settings) #type: ignore
 
 
