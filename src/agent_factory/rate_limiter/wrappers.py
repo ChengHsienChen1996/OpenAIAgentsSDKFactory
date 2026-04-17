@@ -121,10 +121,11 @@ def limits_guard_multi(
 
             sys_tok = count_tokens(sys_text, model_name)
 
+            _max_out = getattr(agent.model_settings, "max_tokens", None) or max_output_tokens
             reserved = max(1,
                            user_tok + sys_tok
                            + safety_pad_tokens
-                           + int(output_buffer_mult * max_output_tokens)
+                           + int(output_buffer_mult * _max_out)
                            + per_round_pad
                            )
             models = [model_name]
@@ -159,6 +160,16 @@ def limits_guard_multi(
                             pass
                 _, wait_rpm, rpm_warned = await _wait_with_trace(_rpm_chain, trace, run_id, "model_rpm_chain", warn_after_s, heartbeat_every_s)
                 if trace: trace("acquired", {"run_id": run_id, "stage": "model_rpm_chain", "wait_s": round(wait_rpm, 2)})
+
+                # RPD（若存在）
+                rpd_limiter = registry.rpd(model_name)
+                if rpd_limiter:
+                    async def _rpd_acq():
+                        async with rpd_limiter:
+                            pass
+                    _, wait_rpd, _ = await _wait_with_trace(_rpd_acq, trace, run_id, "model_rpd", warn_after_s,
+                                                            heartbeat_every_s)
+                    if trace: trace("acquired", {"run_id": run_id, "stage": "model_rpd", "wait_s": round(wait_rpd, 2)})
 
                 # 併發名額（最後拿，拿到就立刻送）
                 async def _sem_and_call():

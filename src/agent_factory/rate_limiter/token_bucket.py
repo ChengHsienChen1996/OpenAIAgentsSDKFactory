@@ -37,16 +37,25 @@ class LimitRegistry:
         # model_limits 例如：{"gpt-4o": {"TPM": 30000, "RPM": 60}, ...}
         self.model_buckets: Dict[str, AsyncTokenBucket] = {}
         self.model_rpms: Dict[str, AsyncLimiter] = {}
+        self.model_rpds: Dict[str, AsyncLimiter] = {}
+
         for m, cfg in model_limits.items():
-            tpm = int(cfg["TPM"]); rpm = int(cfg["RPM"])
+            tpm = int(cfg["TPM"])
+            rpm = int(cfg["RPM"])
             self.model_buckets[m] = AsyncTokenBucket(tpm, tpm / 60.0)
             self.model_rpms[m] = AsyncLimiter(rpm, time_period=60)
+
+            if "RPD" in cfg:  # 可選，有才建立
+                self.model_rpds[m] = AsyncLimiter(cfg["RPD"], time_period=86400)
 
     def bucket(self, model: str) -> AsyncTokenBucket:
         return self.model_buckets[model]
 
     def rpm(self, model: str) -> AsyncLimiter:
         return self.model_rpms[model]
+
+    def rpd(self, model: str):
+        return self.model_rpds.get(model)
 
 
 # ========= 可選 umbrella（預設用 no-op；需要時替換實作） =========
