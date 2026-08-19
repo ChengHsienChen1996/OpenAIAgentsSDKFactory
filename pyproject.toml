@@ -18,3 +18,20 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["agent_factory*"]   # 打包 agent_factory 及其子套件
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# strict：async 測試必須明確標記 @pytest.mark.asyncio（見 docs/testing-strategy.md）
+asyncio_mode = "strict"
+# 明確指定 fixture 事件迴圈範圍；未設定時 pytest-asyncio 1.4 會發出警告
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: 需要真實外部服務（API key、本地 Ollama）才能執行，預設不跑",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-timeout>=2.4.0",
+]
