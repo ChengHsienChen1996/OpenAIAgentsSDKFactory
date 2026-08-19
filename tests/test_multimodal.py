@@ -1,43 +1,36 @@
-# tests/test_multimodal.py
 """多模態（影像輸入）測試：以 Docker 版 Ollama 的 glm-ocr-optimized:latest 辨識 ./imgs 內的圖片。
 
 原生 openai-agents SDK 的寫法是自行 `Agent(...)` + `Runner.run(...)`；
 本 repo 改為由 YAML 宣告 agent（AgentFactory），並以 LimitAgentRunner 帶速率限制執行。
 
-執行：
-    uv run python test/test_multimodal.py
-    uv run python test/test_multimodal.py --limit 1
-    uv run python test/test_multimodal.py --image imgs/20260819_152629.jpg --prompt "OCR:"
+實際呼叫 Ollama 的案例標記為 integration，預設不執行。手動執行方式：
+
+    uv run pytest -m integration tests/test_multimodal.py -s      # 走 pytest
+    uv run python tests/test_multimodal.py --limit 1              # 直接執行、看辨識結果
 """
 import argparse
 import asyncio
 import base64
 import io
 import mimetypes
-import sys
 import time
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-from dotenv import load_dotenv
-
-load_dotenv()
+import pytest
 
 from agents import set_tracing_disabled
 from agents.items import TResponseInputItem
 
-from src.agent_factory.core import AgentFactory
-from src.agent_factory.limit_runner import LimitAgentRunner
+from agent_factory.core import AgentFactory
+from agent_factory.limit_runner import LimitAgentRunner
 
 # 本測試打的是本地 Ollama，沒有 OpenAI 金鑰可上傳 trace，直接關閉避免噪音
 set_tracing_disabled(True)
 
-YAML_SETTINGS_FILE = PROJECT_ROOT / "test" / "multimodal_agents_setup.yaml"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+YAML_SETTINGS_FILE = PROJECT_ROOT / "tests" / "multimodal_agents_setup.yaml"
 IMAGE_DIR = PROJECT_ROOT / "imgs"
 AGENT_NAME = "OllamaOCRAgent"
 DEFAULT_PROMPT = "Table Recognition:"
@@ -111,80 +104,92 @@ def build_input(data_url: str, prompt: str) -> List[TResponseInputItem]:
     ]
 
 
-def test_factory_init() -> AgentFactory:
-    """測試 AgentFactory 能從多模態 YAML 正確初始化"""
+# --------------------------------------------------------------------------- #
+# 不需外部服務的測試
+# --------------------------------------------------------------------------- #
+
+def test_multimodal_yaml_builds_agent():
+    """多模態 YAML 能建出 Agent（僅建立 client，不發出任何請求）。"""
     factory = AgentFactory.create_factory_from_yaml(YAML_SETTINGS_FILE)
-    assert factory is not None
-    print(f"✅ AgentFactory 初始化成功：{YAML_SETTINGS_FILE.relative_to(PROJECT_ROOT)}")
-    return factory
-
-
-def test_get_agent(factory: AgentFactory):
-    """測試能取得多模態 Agent 實例"""
     agent = factory.get_agent_by_name(AGENT_NAME)
-    assert agent is not None
+
     assert agent.name == AGENT_NAME
-    print(f"✅ 取得 Agent 成功：{agent.name}（model={agent.model.model}）")
-    return agent
+    assert agent.model.model == "glm-ocr-optimized:latest"
 
 
-def test_collect_images(limit: Optional[int]) -> List[Path]:
-    """測試能在 ./imgs 找到測試圖片"""
-    images = collect_images(IMAGE_DIR, limit)
-    print(f"✅ 找到 {len(images)} 張測試圖片：{', '.join(p.name for p in images)}")
-    return images
+def test_image_to_data_url_produces_base64_payload(tmp_path, tiny_images: Dict[str, bytes]):
+    """影像會被轉成可解碼的 base64 data URL，且 mime 依副檔名判定。"""
+    image_path = tmp_path / "sample.png"
+    image_path.write_bytes(tiny_images["png"])
+
+    data_url = image_to_data_url(image_path)
+
+    assert data_url.startswith("data:image/png;base64,")
+    payload = data_url.split(",", 1)[1]
+    assert base64.b64decode(payload) == tiny_images["png"]
 
 
-def test_build_input(images: List[Path], prompt: str, max_side: int):
-    """測試 data URL 與多模態 input 結構能正確組出"""
-    data_url = image_to_data_url(images[0], max_side)
-    assert data_url.startswith("data:image/")
-    model_input = build_input(data_url, prompt)
-    assert model_input[0]["content"][0]["type"] == "input_image"
-    assert model_input[1]["content"] == prompt
-    print(f"✅ 多模態 input 組裝成功（data URL 長度 {len(data_url):,} 字元）")
+def test_build_input_wraps_image_and_prompt(tmp_path, tiny_images: Dict[str, bytes]):
+    """多模態 input 應為「影像 message + 文字 message」兩則。"""
+    image_path = tmp_path / "sample.jpeg"
+    image_path.write_bytes(tiny_images["jpeg"])
+
+    model_input = build_input(image_to_data_url(image_path), DEFAULT_PROMPT)
+
+    assert len(model_input) == 2
+    image_item = model_input[0]["content"][0]
+    assert image_item["type"] == "input_image"
+    assert image_item["image_url"].startswith("data:image/jpeg;base64,")
+    assert model_input[1]["content"] == DEFAULT_PROMPT
 
 
-async def test_run_ocr(agent, image_path: Path, prompt: str, max_side: int):
-    """測試實際呼叫 Ollama 進行影像辨識"""
+# --------------------------------------------------------------------------- #
+# 需要本地 Ollama 的測試
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.timeout(600)
+async def test_run_ocr_against_local_ollama():
+    """實際呼叫本地 Ollama 辨識 ./imgs 的第一張圖片。"""
+    if not IMAGE_DIR.is_dir():
+        pytest.skip(f"找不到測試影像資料夾 {IMAGE_DIR}")
+
+    factory = AgentFactory.create_factory_from_yaml(YAML_SETTINGS_FILE)
+    agent = factory.get_agent_by_name(AGENT_NAME)
+    image_path = collect_images(IMAGE_DIR, limit=1)[0]
+
     runner = LimitAgentRunner(agent=agent)
-    data_url = image_to_data_url(image_path, max_side)
+    result = await runner.run(input_=build_input(image_to_data_url(image_path), DEFAULT_PROMPT))
 
-    started = time.monotonic()
-    result = await runner.run(input_=build_input(data_url, prompt))
-    elapsed = time.monotonic() - started
-
-    assert result is not None
-    print(f"\n--- {image_path.name}（耗時 {elapsed:.1f}s）---")
-    print(result.final_output)
-    return result
+    assert result.final_output
 
 
-async def main(args: argparse.Namespace):
-    print("=== 開始多模態測試 ===\n")
+# --------------------------------------------------------------------------- #
+# 手動執行入口（直接看辨識結果用，非 pytest 流程）
+# --------------------------------------------------------------------------- #
 
-    # 不需要 API 的測試
-    factory = test_factory_init()
-    agent = test_get_agent(factory)
+async def _main(args: argparse.Namespace) -> None:
+    factory = AgentFactory.create_factory_from_yaml(YAML_SETTINGS_FILE)
+    agent = factory.get_agent_by_name(AGENT_NAME)
+    runner = LimitAgentRunner(agent=agent)
 
     if args.image:
-        images = [Path(args.image) if Path(args.image).is_absolute() else PROJECT_ROOT / args.image]
-        print(f"✅ 使用指定圖片：{images[0]}")
+        image = Path(args.image)
+        images = [image if image.is_absolute() else PROJECT_ROOT / image]
     else:
-        images = test_collect_images(args.limit)
+        images = collect_images(IMAGE_DIR, args.limit)
 
-    test_build_input(images, args.prompt, args.max_side)
-
-    # 需要 API 的測試（最後執行）
-    print("\n--- Ollama 呼叫測試 ---")
     for image_path in images:
-        await test_run_ocr(agent, image_path, args.prompt, args.max_side)
+        data_url = image_to_data_url(image_path, args.max_side)
+        started = time.monotonic()
+        result = await runner.run(input_=build_input(data_url, args.prompt))
+        print(f"\n--- {image_path.name}（耗時 {time.monotonic() - started:.1f}s）---")
+        print(result.final_output)
 
-    print("\n=== 測試完成 ===")
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Ollama 多模態（OCR）測試")
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Ollama 多模態（OCR）手動測試")
     parser.add_argument("--image", help="只測試單一圖片（相對於專案根目錄或絕對路徑）")
     parser.add_argument("--limit", type=int, default=None, help="最多測試幾張圖片")
     parser.add_argument("--prompt", default=DEFAULT_PROMPT, help=f"文字提示，預設 {DEFAULT_PROMPT!r}")
@@ -198,4 +203,4 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    asyncio.run(main(parse_args()))
+    asyncio.run(_main(_parse_args()))

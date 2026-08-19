@@ -1,95 +1,58 @@
-# tests/test_basic.py
-import asyncio
+"""AgentFactory 的單元測試。
+
+由原 tests/test_basic.py 拆分而來：本檔負責 AgentFactory，
+YAML 載入與 Pydantic 驗證的部分移至 tests/test_config_loader.py。
+"""
 import os
-from dotenv import load_dotenv
 
-load_dotenv()
+import pytest
+from agents import Agent
 
-from src.agent_factory.core import AgentFactory
-from src.agent_factory.limit_runner import LimitAgentRunner
-
-
-def test_factory_init():
-    """測試 AgentFactory 能正確從 YAML 初始化"""
-    factory = AgentFactory.create_factory_from_yaml(os.getenv("YAML_SETTINGS_FILE"))
-    assert factory is not None
-    print("✅ AgentFactory 初始化成功")
-    return factory
+from agent_factory.core import AgentFactory
+from agent_factory.limit_runner import LimitAgentRunner
 
 
-def test_get_agent(factory: AgentFactory):
-    """測試能正確取得 Agent 實例"""
-    agent = factory.get_agent_by_name("GemmaTestAgent")
-    assert agent is not None
-    assert agent.name == "GemmaTestAgent"
-    print(f"✅ 取得 Agent 成功：{agent.name}")
-    return agent
+def test_create_factory_from_yaml_returns_factory(sample_yaml_path):
+    """能從 YAML 路徑初始化 AgentFactory。"""
+    factory = AgentFactory.create_factory_from_yaml(sample_yaml_path)
+
+    assert isinstance(factory, AgentFactory)
 
 
-def test_get_agent_not_found(factory: AgentFactory):
-    """測試取得不存在的 Agent 時拋出 KeyError"""
-    try:
-        factory.get_agent_by_name("NotExist")
-        print("❌ 應該要拋出 KeyError")
-    except KeyError:
-        print("✅ KeyError 正確拋出")
+def test_get_agent_by_name_returns_configured_agent(sample_factory):
+    """依 YAML 的 name 欄位取得 Agent，且回傳的是設定中那一個。"""
+    agent = sample_factory.get_agent_by_name("SampleAgent")
+
+    assert isinstance(agent, Agent)
+    assert agent.name == "SampleAgent"
 
 
-def test_config_validation_fail():
-    """測試 YAML 設定錯誤時能正確拋出 ValueError"""
-    import tempfile, textwrap
-    invalid_yaml = textwrap.dedent("""
-        agents:
-          test:
-            - bad_agent:
-                name: BadAgent
-                model_instruction:
-                  dynamic_prompt: true
-                  instruction_file_path: some/path.md
-                  # 故意漏掉 dynamic_module_path 和 model_context_path
-                model_params:
-                  model: gemma-4-31b-it
-                  client:
-                    api_key: test
-                    base_url: https://example.com
-    """)
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
-        f.write(invalid_yaml)
-        tmp_path = f.name
+def test_get_agent_by_name_uses_static_instruction_file(sample_factory):
+    """dynamic_prompt=false 時，instructions 應為 instruction_file_path 的檔案內容。"""
+    agent = sample_factory.get_agent_by_name("SampleAgent")
 
-    try:
-        AgentFactory.create_factory_from_yaml(tmp_path)
-        print("❌ 應該要拋出 ValueError")
-    except ValueError as e:
-        print(f"✅ ValueError 正確拋出：{e}")
-    finally:
-        os.unlink(tmp_path)
+    assert isinstance(agent.instructions, str)
+    assert "單元測試用的助理" in agent.instructions
 
 
-async def test_run_agent(agent):
-    """測試實際呼叫 API"""
+def test_get_agent_by_name_unknown_raises_key_error(sample_factory):
+    """取不到對應名稱的 agent 時拋出 KeyError，訊息帶上該名稱。"""
+    with pytest.raises(KeyError, match="NotExist"):
+        sample_factory.get_agent_by_name("NotExist")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_run_agent_against_real_api():
+    """實際呼叫 API（需 YAML_SETTINGS_FILE 與有效金鑰，預設不執行）。"""
+    yaml_path = os.getenv("YAML_SETTINGS_FILE")
+    if not yaml_path:
+        pytest.skip("未設定 YAML_SETTINGS_FILE")
+
+    factory = AgentFactory.create_factory_from_yaml(yaml_path)
+    agent = factory.get_agent_by_name(os.getenv("INTEGRATION_AGENT_NAME", "GemmaTestAgent"))
+
     runner = LimitAgentRunner(agent=agent)
     result = await runner.run(input_="請用一句話介紹你自己")
-    assert result is not None
-    print(f"✅ Agent 回應成功")
-    print(f"   回應內容：{result.final_output}")
 
-
-async def main():
-    print("=== 開始基礎測試 ===\n")
-
-    # 不需要 API 的測試
-    factory = test_factory_init()
-    agent = test_get_agent(factory)
-    test_get_agent_not_found(factory)
-    test_config_validation_fail()
-
-    # 需要 API 的測試（最後執行）
-    print("\n--- API 呼叫測試 ---")
-    await test_run_agent(agent)
-
-    print("\n=== 測試完成 ===")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    assert result.final_output
