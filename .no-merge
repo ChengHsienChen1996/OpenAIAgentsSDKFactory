@@ -1,0 +1,8 @@
+# 不會合併進 main 的路徑（在 dev_ai 保留本地版控，合併時剝離）。
+# 規則：一行一條；資料夾結尾加 /；# 開頭為註解；空行略過。
+# merge-to-main.sh 與 .githooks/pre-push 共用此清單。
+
+CLAUDE.md
+.claude/
+.agent/
+logs/
