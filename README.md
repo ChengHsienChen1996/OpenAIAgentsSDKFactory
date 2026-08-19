@@ -221,16 +221,26 @@ agents:
 
 ### 參考實作
 
-`test/test_multimodal.py` 是可直接執行的完整範例，以 Docker 版 Ollama 的 `glm-ocr-optimized:latest` 辨識 `./imgs` 內的圖片：
+`tests/test_multimodal.py` 是完整範例，以 Docker 版 Ollama 的 `glm-ocr-optimized:latest` 辨識 `./imgs` 內的圖片。
+
+實際呼叫 Ollama 的案例標記為 `integration`，`uv run pytest` 預設不執行；要跑需明確指定：
 
 ```bash
-uv run python test/test_multimodal.py                    # 測試 ./imgs 內所有圖片
-uv run python test/test_multimodal.py --limit 1          # 只測第一張
-uv run python test/test_multimodal.py --image imgs/table.jpg --prompt "OCR:"
-uv run python test/test_multimodal.py --max-side 1600    # 先等比縮圖（需另行安裝 Pillow）
+uv run pytest -m integration tests/test_multimodal.py -s
 ```
 
-搭配的設定檔為 `test/multimodal_agents_setup.yaml` 與 `test/prompt_files/ocr_instruction.md`。
+也可直接執行該檔，用 CLI 參數逐張看辨識結果：
+
+```bash
+uv run python tests/test_multimodal.py                    # 測試 ./imgs 內所有圖片
+uv run python tests/test_multimodal.py --limit 1          # 只測第一張
+uv run python tests/test_multimodal.py --image imgs/table.jpg --prompt "OCR:"
+uv run python tests/test_multimodal.py --max-side 1600    # 先等比縮圖（需另行安裝 Pillow）
+```
+
+搭配的設定檔為 `tests/multimodal_agents_setup.yaml` 與 `tests/prompt_files/ocr_instruction.md`。
+
+> **執行前需自備影像**：`imgs/` 是本機測試資料夾，內容因人而異且體積大，**不納入版控**（已列於 `.gitignore`）。請自行建立 `imgs/` 並放入待辨識的圖片，否則 integration 測試會被跳過。
 
 ### 影像輸入與 TPM 預扣
 

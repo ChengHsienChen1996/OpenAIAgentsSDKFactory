@@ -37,7 +37,7 @@
 | 速率限制 | `aiolimiter >= 1.2.1` + 自製 `AsyncTokenBucket` | RPM/RPD 用現成 limiter；TPM 需要預扣／退款語意，現成套件不支援故自製 |
 | Token 計數 | `tiktoken >= 0.12.0` | 文字 token 估算 |
 | 環境變數 | `python-dotenv >= 1.1.1` | `.env` 載入 |
-| 測試 | `pytest` + `pytest-asyncio` | 依 testing-strategy.md；**待確認：目前 `pyproject.toml` 尚未宣告這兩個依賴，Phase 1 需補上** |
+| 測試 | `pytest >= 9.1.1` + `pytest-asyncio >= 1.4.0` + `pytest-timeout >= 2.4.0` | 依 testing-strategy.md，宣告於 `[dependency-groups].dev`。`asyncio_mode = "strict"`（async 測試須明確標記）；`pytest-timeout` 用於守住速率限制測試的無限等待失敗模式 |
 
 ## 資源預算
 
@@ -78,17 +78,20 @@ docker run -d -p 11434:11434 --name ollama ollama/ollama
 
 > **待確認**：README 中的模型 tag `glm-ocr-optimized:latest` 為自訂本地 tag，非 Ollama 官方 registry 名稱；`OLLAMA_BASE_URL` 預設 `http://localhost:11434/v1`。開工前請向使用者確認實際可用的模型名稱。
 
-### 已知的 repo 缺件
+### 測試素材的版控歸屬（Phase 1 Task 1.4 已確認）
 
-> **待確認**：README 與 `test/test_multimodal.py` 引用了以下路徑，但目前不在版控中 —— 是刻意 gitignore 還是遺漏，開工前需確認：
-> - `test/multimodal_agents_setup.yaml`
-> - `test/prompt_files/ocr_instruction.md`
-> - `imgs/`（測試影像資料夾）
+| 路徑 | 歸屬 | 說明 |
+|------|------|------|
+| `tests/multimodal_agents_setup.yaml` | 納入版控 | 多模態測試設定，作為測試紀錄保留 |
+| `tests/prompt_files/ocr_instruction.md` | 納入版控 | 同上 |
+| `imgs/` | **不納入版控**（已列於 `.gitignore`） | 本機測試影像，內容因人而異且體積大，執行前需自備 |
+| `tests/fixtures/` | 納入版控 | 單元測試用最小素材，不依賴環境變數與網路 |
 
 ### 常用指令
 
 ```bash
-uv sync                                    # 安裝依賴
-uv run pytest                              # 執行測試（Phase 1 建立 tests/ 後可用）
-uv run python test/test_multimodal.py      # 多模態手動驗證（需本地 Ollama）
+uv sync                                             # 安裝依賴
+uv run pytest                                       # 執行測試（integration 預設排除）
+uv run pytest -m integration                        # 只跑需真實服務的測試
+uv run python tests/test_multimodal.py --limit 1    # 多模態手動驗證（需本地 Ollama 與自備 imgs/）
 ```

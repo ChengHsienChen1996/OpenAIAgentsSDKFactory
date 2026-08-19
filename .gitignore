@@ -30,6 +30,11 @@ venv/
 .idea/
 .vscode/
 
+# --- 測試資料 ---
+# 多模態測試的輸入影像放置處，屬使用者本機資料，不納入版控（體積大且內容因人而異）。
+# tests/test_multimodal.py 的 integration 測試會讀取此資料夾，執行前需自備影像。
+imgs/
+
 # 注意：dev_ai 專屬的隔離檔案（CLAUDE.md、.claude/、.agent/、logs/）
 # 「不」列在此處 —— 它們要保留本地版控（可回溯歷史）。
 # 阻擋其進入 main 的責任改由 scripts/merge-to-main.sh 與 .githooks/pre-push
