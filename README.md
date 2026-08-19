@@ -8,6 +8,7 @@
 - **多維度速率限制**：TPM / RPM / RPD 三層限制，搭配預扣、退款、心跳追蹤
 - **Pydantic 設定驗證**：啟動時驗證所有 agent 設定，錯誤訊息包含欄位路徑
 - **可插拔供應商**：任何 OpenAI-compatible endpoint 皆可使用，不鎖定單一雲端
+- **多模態輸入**：以 `input_image` message 傳入影像，適用於本地／自架 vision 模型（雲端模型限制見下文）
 
 ---
 
@@ -146,6 +147,111 @@ class SummaryOutput(BaseModel):
     summary: str
     key_points: list[str]
 ```
+
+---
+
+## 多模態（影像）輸入
+
+### input 格式
+
+`LimitAgentRunner.run()` 的 `input_` 除了字串，也接受 `list[TResponseInputItem]`（即 openai-agents SDK 的 message list）。影像以 `input_image` content item 傳入，值為 base64 data URL：
+
+```python
+import base64
+from pathlib import Path
+
+
+def image_to_data_url(image_path: Path, mime: str = "image/jpeg") -> str:
+    b64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+
+model_input = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "input_image",
+                "detail": "auto",
+                "image_url": image_to_data_url(Path("imgs/table.jpg")),
+            }
+        ],
+    },
+    {
+        "role": "user",
+        "content": "Table Recognition:",
+    },
+]
+
+result = await runner.run(input_=model_input)
+print(result.final_output)
+```
+
+影像與文字可拆成兩則 message（如上），也可合併在同一則 message 的 `content` 陣列中。`detail` 可用 `"auto"` / `"low"` / `"high"`，自架模型通常會忽略此欄位。
+
+### YAML 設定
+
+多模態 agent 的設定與一般 agent 完全相同——只要 `model` 指向具備 vision 能力的模型即可，不需要額外欄位：
+
+```yaml
+# 本地 Ollama（Docker）：docker run -d -p 11434:11434 --name ollama ollama/ollama
+ollama: &ollama
+  client:
+    api_key: ${oc.env:OLLAMA_API_KEY, 'ollama'}   # Ollama 不驗證，但 AsyncOpenAI 要求非空字串
+    base_url: ${oc.env:OLLAMA_BASE_URL, 'http://localhost:11434/v1'}
+  params:
+    temperature: 0.0
+
+agents:
+  multimodal:
+    - ocr_agent:
+        name: OllamaOCRAgent
+        model_instruction:
+          dynamic_prompt: false
+          instruction_file_path: ${__dir__}/prompt_files/ocr_instruction.md
+        model_params:
+          <<: *ollama
+          model: glm-ocr-optimized:latest
+          params:
+            temperature: 0.0
+            max_tokens: 4096
+```
+
+別忘了在 `MODEL_LIMITS` 加入該模型名稱，否則取得 bucket 時會拋出 `KeyError`。
+
+### 參考實作
+
+`test/test_multimodal.py` 是可直接執行的完整範例，以 Docker 版 Ollama 的 `glm-ocr-optimized:latest` 辨識 `./imgs` 內的圖片：
+
+```bash
+uv run python test/test_multimodal.py                    # 測試 ./imgs 內所有圖片
+uv run python test/test_multimodal.py --limit 1          # 只測第一張
+uv run python test/test_multimodal.py --image imgs/table.jpg --prompt "OCR:"
+uv run python test/test_multimodal.py --max-side 1600    # 先等比縮圖（需另行安裝 Pillow）
+```
+
+搭配的設定檔為 `test/multimodal_agents_setup.yaml` 與 `test/prompt_files/ocr_instruction.md`。
+
+### 影像輸入與 TPM 預扣
+
+> ⚠️ 這一節是多模態路徑目前最主要的限制，套用到雲端模型前務必先讀。
+
+`limits_guard_multi` 以 `count_tokens(str(input_))` 估算預扣 token 量，**base64 影像字串會被整串計入**。實測一張 2.7 MB 的相機直出相片，預扣量約 **2,550,000 token**——與該影像實際消耗的 vision token（通常數百至數千）相差三個數量級。
+
+這會造成兩種後果：
+
+**1. 本地／自架模型**：`AsyncTokenBucket.acquire()` 在 `amount > capacity` 時會無限迴圈等待（配額永遠補不滿），因此該模型的 `TPM` 必須明顯大於單次預扣量。本地模型沒有供應商配額，直接給一個夠大的值即可：
+
+```python
+MODEL_LIMITS = {
+    # 本地 Ollama：TPM 純粹為滿足 LimitRegistry，非真實配額
+    "glm-ocr-optimized:latest": {"TPM": 50000000, "RPM": 600},
+}
+```
+
+**2. 雲端 vision 模型（目前尚未支援）**：雲端供應商的真實 TPM 配額（如 OpenAI Tier 1 的 30,000）遠小於單張影像的預扣估算值，套用現行邏輯會直接卡死在 TPM 等待階段，且無法比照本地模型把 `TPM` 灌大——那等同於停用速率管制，實際請求會改由供應商回 429。
+
+若要對 `gpt-4.1`、Gemini 等雲端模型跑多模態，需先調整 `wrappers.py` 的預扣估算邏輯：把 `input_` 中的 `input_image` item 從文字計數中抽離，改以各供應商公布的影像 token 成本（依解析度／`detail` 換算的固定值）計入。在此之前，多模態路徑僅建議用於本地／無配額的自架模型。
 
 ---
 
@@ -298,3 +404,5 @@ from agent_factory.agent_builder import AgentBuilder
 - **Gemini `AQ.` 前綴 API key**：使用 Google AI Studio 新建的 API key 透過 Gemini OpenAI-compatible endpoint 呼叫時，會出現 `400 Multiple authentication credentials received` 錯誤。需改用從 Google Cloud Console 建立的 `AIza` 開頭格式。詳細步驟與驗證程式碼請參見 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。
 
 - **`MODEL_LIMITS` 未涵蓋的模型**：若使用的模型名稱不在 `MODEL_LIMITS` 字典中，速率限制模組在取得 bucket 時會拋出 `KeyError`。請在 `limits_parameters.py` 的 `MODEL_LIMITS` 新增對應設定後再使用。
+
+- **雲端 vision 模型的多模態輸入**：預扣估算會把 base64 影像當成文字整串計數，估算值遠超雲端供應商的實際 TPM 配額，請求會卡死在 TPM 等待階段。目前多模態路徑僅支援本地／無配額的自架模型，詳見 [影像輸入與 TPM 預扣](#影像輸入與-tpm-預扣)。

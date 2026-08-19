@@ -20,6 +20,12 @@ MODEL_LIMITS = {
 
     ### Gemini API Free Tier Rate limit at 2026/04
     "gemma-4-31b-it": {"TPM": 30000, "RPM": 15, "RPD": 1500},
+
+    ### 本地 Ollama（無供應商配額，僅為滿足 LimitRegistry 而設）
+    # 多模態輸入的 base64 影像會被 count_tokens 整串計入預扣量：
+    # 一張 2.7 MB 的相機直出相片實測預扣約 2.5M token。TPM 必須明顯大於單次預扣量，
+    # 否則 AsyncTokenBucket.acquire() 會因 capacity < amount 而永遠等不到配額。
+    "glm-ocr-optimized:latest": {"TPM": 50000000, "RPM": 600},
 }
 
 GLOBAL_CONCURRENCY = int(os.getenv("GLOBAL_CONCURRENCY", 6))
