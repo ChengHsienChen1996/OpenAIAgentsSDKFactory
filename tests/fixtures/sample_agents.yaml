@@ -1,0 +1,21 @@
+# tests/fixtures/sample_agents.yaml
+# 單元測試用的最小 agent 設定。
+#
+# 刻意不依賴任何環境變數與網路：api_key 為假值、base_url 指向保留網域
+# （.invalid 由 RFC 2606 保證永不可解析），因此建立 Agent 不會、也不可能發出請求。
+# 本檔不使用 dynamic_prompt 與 output_schema，避免相依於實際存在的 Python 模組。
+
+agents:
+  unit_test:
+    - sample_agent:
+        name: SampleAgent
+        model_instruction:
+          dynamic_prompt: false
+          instruction_file_path: ${__dir__}/prompt_files/sample_instruction.md
+        model_params:
+          model: gpt-4.1
+          client:
+            api_key: test-key-not-real
+            base_url: https://example.invalid/v1
+          params:
+            temperature: 0.0

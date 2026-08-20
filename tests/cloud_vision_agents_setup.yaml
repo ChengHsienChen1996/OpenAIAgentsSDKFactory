@@ -1,0 +1,37 @@
+# tests/cloud_vision_agents_setup.yaml
+# 雲端 vision 模型的估算誤差實測用設定（Phase 4 Task 4.2）。
+#
+# 刻意只收錄 mini 級模型：本實測的目的是驗證影像 token 換算公式，
+# 與模型能力無關，用最便宜的即可。兩個 agent 分別涵蓋兩種公式家族：
+#   - gpt-4o-mini   → tile-based（base 2833 / per-tile 5667）
+#   - gpt-4.1-mini  → patch-based（multiplier 1.62，patch budget 1536）
+#
+# 執行方式見 docs/TROUBLESHOOTING.md 或 Phase 4 的實測清單。
+
+openai: &openai
+  client:
+    api_key: ${oc.env:OPENAI_API_KEY, ''}
+    base_url: https://api.openai.com/v1
+  params:
+    temperature: 0.0
+    max_tokens: 64          # 只需模型回一小段話，輸出越短花費越低
+
+agents:
+  cloud_vision:
+    - tile_based_agent:
+        name: TileBasedAgent
+        model_instruction:
+          dynamic_prompt: false
+          instruction_file_path: ${__dir__}/prompt_files/vision_probe_instruction.md
+        model_params:
+          <<: *openai
+          model: gpt-4o-mini
+
+    - patch_based_agent:
+        name: PatchBasedAgent
+        model_instruction:
+          dynamic_prompt: false
+          instruction_file_path: ${__dir__}/prompt_files/vision_probe_instruction.md
+        model_params:
+          <<: *openai
+          model: gpt-4.1-mini

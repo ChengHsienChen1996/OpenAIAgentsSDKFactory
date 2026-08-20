@@ -6,9 +6,10 @@
 
 - **YAML 驅動的 AgentFactory**：以設定檔宣告 agent，支援靜態與動態 prompt 兩種模式
 - **多維度速率限制**：TPM / RPM / RPD 三層限制，搭配預扣、退款、心跳追蹤
+- **可切換的限制策略**：雲端模型完整管制、本地模型只受併發約束，差異由設定宣告而非改程式
 - **Pydantic 設定驗證**：啟動時驗證所有 agent 設定，錯誤訊息包含欄位路徑
 - **可插拔供應商**：任何 OpenAI-compatible endpoint 皆可使用，不鎖定單一雲端
-- **多模態輸入**：以 `input_image` message 傳入影像，適用於本地／自架 vision 模型（雲端模型限制見下文）
+- **多模態輸入**：以 `input_image` message 傳入影像，影像 token 依各供應商公式估算，不做文字計數
 
 ---
 
@@ -191,7 +192,7 @@ print(result.final_output)
 
 ### YAML 設定
 
-多模態 agent 的設定與一般 agent 完全相同——只要 `model` 指向具備 vision 能力的模型即可，不需要額外欄位：
+多模態 agent 的設定與一般 agent 完全相同——只要 `model` 指向具備 vision 能力的模型即可：
 
 ```yaml
 # 本地 Ollama（Docker）：docker run -d -p 11434:11434 --name ollama ollama/ollama
@@ -215,43 +216,102 @@ agents:
           params:
             temperature: 0.0
             max_tokens: 4096
+          limits:
+            policy: concurrency_only   # 本地模型：不必填任何 TPM／RPM 數值
 ```
 
-別忘了在 `MODEL_LIMITS` 加入該模型名稱，否則取得 bucket 時會拋出 `KeyError`。
+本地／自架模型建議宣告 `limits: {policy: concurrency_only}`（如上）——本地推理無帳單，TPM／RPM 不對應任何真實約束，唯一有意義的管制是併發數。未宣告時會沿用 `MODEL_LIMITS`，兩處都沒有則依 `DEFAULT_POLICY` 執行並發出一次警告。詳見〈[速率限制說明](#速率限制說明)〉。
 
 ### 參考實作
 
-`test/test_multimodal.py` 是可直接執行的完整範例，以 Docker 版 Ollama 的 `glm-ocr-optimized:latest` 辨識 `./imgs` 內的圖片：
+`tests/test_multimodal.py` 是完整範例，以 Docker 版 Ollama 的 `glm-ocr-optimized:latest` 辨識 `./imgs` 內的圖片。
+
+實際呼叫 Ollama 的案例標記為 `integration`，`uv run pytest` 預設不執行；要跑需明確指定：
 
 ```bash
-uv run python test/test_multimodal.py                    # 測試 ./imgs 內所有圖片
-uv run python test/test_multimodal.py --limit 1          # 只測第一張
-uv run python test/test_multimodal.py --image imgs/table.jpg --prompt "OCR:"
-uv run python test/test_multimodal.py --max-side 1600    # 先等比縮圖（需另行安裝 Pillow）
+uv run pytest -m integration tests/test_multimodal.py -s
 ```
 
-搭配的設定檔為 `test/multimodal_agents_setup.yaml` 與 `test/prompt_files/ocr_instruction.md`。
+也可直接執行該檔，用 CLI 參數逐張看辨識結果：
 
-### 影像輸入與 TPM 預扣
+```bash
+uv run python tests/test_multimodal.py                    # 測試 ./imgs 內所有圖片
+uv run python tests/test_multimodal.py --limit 1          # 只測第一張
+uv run python tests/test_multimodal.py --image imgs/table.jpg --prompt "OCR:"
+uv run python tests/test_multimodal.py --max-side 1600    # 先等比縮圖（需另行安裝 Pillow）
+```
 
-> ⚠️ 這一節是多模態路徑目前最主要的限制，套用到雲端模型前務必先讀。
+搭配的設定檔為 `tests/multimodal_agents_setup.yaml` 與 `tests/prompt_files/ocr_instruction.md`。
 
-`limits_guard_multi` 以 `count_tokens(str(input_))` 估算預扣 token 量，**base64 影像字串會被整串計入**。實測一張 2.7 MB 的相機直出相片，預扣量約 **2,550,000 token**——與該影像實際消耗的 vision token（通常數百至數千）相差三個數量級。
+> **執行前需自備影像**：`imgs/` 是本機測試資料夾，內容因人而異且體積大，**不納入版控**（已列於 `.gitignore`）。請自行建立 `imgs/` 並放入待辨識的圖片，否則 integration 測試會被跳過。
 
-這會造成兩種後果：
+### 影像輸入的 token 估算
 
-**1. 本地／自架模型**：`AsyncTokenBucket.acquire()` 在 `amount > capacity` 時會無限迴圈等待（配額永遠補不滿），因此該模型的 `TPM` 必須明顯大於單次預扣量。本地模型沒有供應商配額，直接給一個夠大的值即可：
+輸入 token 由 `estimate_input_tokens()` 走訪 `input_` 結構後分項估算，**base64 影像字串絕不參與文字計數**——影像改由 `image_tokens.py` 依供應商公式從寬高換算。
+
+估算結果為分項結構，會完整寫進 trace 的 `estimate_ready` 事件：
+
+| 分項 | 內容 |
+|------|------|
+| `text_tok` | `input_text` / `output_text` / `refusal` 與字串型 content |
+| `image_tok` | `input_image`，依模型套用對應的換算公式 |
+| `other_tok` | 每則 message 的固定 overhead，以及無法識別的 item |
+| `image_count` | 影像數量 |
+| `has_unknown_items` | 是否含無法識別的 item（該項以保守常數計入） |
+
+#### 影像尺寸如何取得
+
+以純 Python 解析影像 header 取得寬高，**不引入 Pillow、也不完整解碼 base64**。支援 JPEG（SOF marker）、PNG（IHDR）、WebP（VP8／VP8L／VP8X）、GIF（logical screen descriptor）。
+
+先解碼開頭 512 bytes；JPEG 的 SOF 位置浮動（相機直出相片的 EXIF 常內嵌縮圖，實測 SOF 落在 60–70 KB 處），找不到時擴讀至 128 KB 上限。**遠端 `http(s)` URL 一律回傳 `None`，不會發出任何網路請求。**
+
+#### 已涵蓋的估算器
+
+| 供應商 | 模型前綴 | 公式 |
+|--------|---------|------|
+| OpenAI | `gpt-4o`、`gpt-4o-mini`、`gpt-4.1`、`gpt-4.5`、`o1`、`o3` | tile-based |
+| OpenAI | `gpt-4.1-mini`、`gpt-4.1-nano`、`gpt-5-mini`、`gpt-5-nano`、`gpt-5.4-mini`、`gpt-5.4-nano`、`o4-mini` | patch-based |
+| Google | `gemini` | 768px tile |
+
+比對取**最長符合的前綴**——`gpt-4.1-mini` 走 patch-based，不會被較短的 `gpt-4.1`（tile-based）攔截。
+
+`gpt-4o-mini` 與 `gpt-4.1-mini` 已用真實 API 回報的計費數字驗證，四種尺寸的估算誤差皆在 1.00–1.01x（見 `logs/2026-08-20_test_multimodal-estimation-validation.md`）。其餘模型的公式依官方文件實作，尚未逐一實測。
+
+#### fallback 行為
+
+一律取保守高值（高估只是請求稍慢，低估會撞供應商 429 而本模組不做自動重試）：
+
+| 情況 | 行為 |
+|------|------|
+| 尺寸無法解析（遠端 URL、格式不支援、header 截斷） | 取該模型家族的 high-detail 上限，log warning |
+| 模型無對應估算器 | 取 `FALLBACK_IMAGE_TOKENS`（3,000），log warning |
+| 有影像但模型無估算器 | 額外在開始等待配額前先 log warning |
+
+#### 為新供應商新增估算器
+
+只需在 `image_tokens.py` 的 `IMAGE_TOKEN_ESTIMATORS` 新增一個 entry，**不需修改任何走訪邏輯**：
 
 ```python
-MODEL_LIMITS = {
-    # 本地 Ollama：TPM 純粹為滿足 LimitRegistry，非真實配額
-    "glm-ocr-optimized:latest": {"TPM": 50000000, "RPM": 600},
+IMAGE_TOKEN_ESTIMATORS = {
+    "my-provider-vision": lambda width, height, detail: ...,
+}
+
+UNKNOWN_SIZE_TOKENS = {
+    "my-provider-vision": 4000,   # 尺寸不可得時的保守值，須一併新增
 }
 ```
 
-**2. 雲端 vision 模型（目前尚未支援）**：雲端供應商的真實 TPM 配額（如 OpenAI Tier 1 的 30,000）遠小於單張影像的預扣估算值，套用現行邏輯會直接卡死在 TPM 等待階段，且無法比照本地模型把 `TPM` 灌大——那等同於停用速率管制，實際請求會改由供應商回 429。
+兩個字典必須一一對應（有測試守住）。每個估算器的 docstring 必須寫明官方文件連結與查閱日期——這類規則會隨模型改版失效，沒有來源就無法判斷是否過期。
 
-若要對 `gpt-4.1`、Gemini 等雲端模型跑多模態，需先調整 `wrappers.py` 的預扣估算邏輯：把 `input_` 中的 `input_image` item 從文字計數中抽離，改以各供應商公布的影像 token 成本（依解析度／`detail` 換算的固定值）計入。在此之前，多模態路徑僅建議用於本地／無配額的自架模型。
+#### 效果
+
+同一張 2.69 MB／4000×3000 相片，改為分項估算前後：
+
+| 模型 | 改動前 | 改動後 |
+|------|-------:|-------:|
+| `gpt-4o` | 2,439,832 | 776 |
+| `gpt-4.1-mini` | 2,439,832 | 2,417 |
+| `gemini-2.5-flash` | 2,439,832 | 1,043 |
 
 ---
 
@@ -287,28 +347,57 @@ src/agent_factory/
 | **RPM** | 每分鐘請求次數上限 | `aiolimiter.AsyncLimiter` |
 | **RPD** | 每日請求次數上限（選填，用於 Free Tier 供應商） | `aiolimiter.AsyncLimiter` |
 
-每次呼叫的等待順序：`Umbrella TPM → 模型 TPM → 模型 RPM → 模型 RPD（若存在）→ 全域 Semaphore`
+每次呼叫的等待順序：`Umbrella TPM → 模型 TPM → 模型 RPM → 模型 RPD（若存在）→ 全域 RPM → 全域 Semaphore`
 
-呼叫完成後，框架會依 `raw_responses` 的實際 token 用量自動校正：低估補扣、高估退款。
+呼叫完成後，框架會依 `raw_responses` 的實際 token 用量自動校正：低估補扣、高估退款。供應商完全未回報用量時，整筆預扣會全額退回並記錄一則 error——寧可短暫超額，也不讓桶被靜默抽乾。
 
-### 新增或調整模型配額
+### 限制策略
 
-編輯 `src/agent_factory/rate_limiter/limits_parameters.py` 的 `MODEL_LIMITS`：
+每個模型套用一種策略，差異由限制器的型別吸收：
+
+| 策略 | TPM | RPM／RPD | 全域併發 | 適用 |
+|------|-----|---------|---------|------|
+| `enforced` | 實際管制 | 實際管制 | 是 | 雲端供應商 |
+| `concurrency_only` | 不管制 | 不管制 | 是 | 本地／自架模型 |
+| `unlimited` | 不管制 | 不管制 | 否 | 特殊情境 |
+
+**選用建議**：雲端供應商用 `enforced` 並填入該帳號的實際配額；本地／自架模型用 `concurrency_only`——本地推理無帳單，TPM／RPM 不對應任何真實約束，真正的瓶頸是 GPU 序列化執行，唯一有意義的管制是併發數。
+
+`enforced` 必須填 `TPM` 與 `RPM`（缺少時啟動即驗證失敗）；另外兩種不需要任何配額數值。
+
+### 設定來源與優先序
+
+**`agent YAML 的 model_params.limits` > `MODEL_LIMITS` > `DEFAULT_POLICY`**
+
+**1. agent YAML**（優先序最高）：
+
+```yaml
+model_params:
+  model: glm-ocr-optimized:latest
+  limits:
+    policy: concurrency_only
+```
+
+**2. `MODEL_LIMITS`**（`limits_parameters.py`）：
 
 ```python
 MODEL_LIMITS = {
-    # OpenAI Tier 1（2025/09）
+    # OpenAI Tier 1（2025/09）；未寫 policy 時視為 enforced
     "gpt-4.1": {"TPM": 30000, "RPM": 500, "TPD": 90000},
 
     # Gemini Free Tier（2026/04）
     "gemma-4-31b-it": {"TPM": 30000, "RPM": 15, "RPD": 1500},
 
-    # 自訂供應商（RPD 選填，不設定則無每日限制）
-    "my-custom-model": {"TPM": 100000, "RPM": 60},
+    # 本地模型：不必填配額數值
+    "glm-ocr-optimized:latest": {"policy": "concurrency_only"},
 }
 ```
 
+**3. `DEFAULT_POLICY`**：兩處都沒有登錄的模型套用此策略，預設 `concurrency_only`，可由環境變數 `LIMIT_DEFAULT_POLICY` 覆寫。此時會發出一次警告（同一模型只警告一次），**不會拋出例外**。
+
 > `TPD` 欄位為記錄用途，速率管制實際使用 `TPM`。`RPD` 存在時才建立每日限制器。
+>
+> 同一模型被兩個 agent 以**不同** limits 宣告時，以先註冊者為準並記錄 warning，不做合併——合併兩組配額會產生沒有人宣告過的隱性行為。設定相同的重複註冊則為冪等操作。
 
 ### 全域 Umbrella
 
@@ -316,10 +405,18 @@ MODEL_LIMITS = {
 
 ```python
 # umbrella = NoopUmbrella()
-umbrella = AdaptiveUmbrella(init_tpm=sum(v["TPM"] for v in MODEL_LIMITS.values()))
+umbrella = AdaptiveUmbrella(
+    init_tpm=sum(v["TPM"] for v in MODEL_LIMITS.values() if "TPM" in v)
+)
 ```
 
-`AdaptiveUmbrella` 遇到速率錯誤時會自動縮減全域 TPM 配額（乘以 `dec_mult=0.75`），並每分鐘逐步恢復（`inc_per_min=1000`）。
+> `if "TPM" in v` 不可省略——`concurrency_only` 與 `unlimited` 的 entry 沒有 `TPM` 鍵。
+
+`AdaptiveUmbrella` 遇到速率錯誤時會自動縮減全域 TPM 配額（乘以 `dec_mult=0.75`），並每分鐘逐步恢復（`inc_per_min=1000`）。縮減後若單筆預扣量超過當前 capacity，會取用全部可得額度並記錄 warning，而非讓該次請求失敗。
+
+### 單次預扣量超過桶容量
+
+`enforced` 模型的單次預扣量若超過該模型的 `TPM`，`AsyncTokenBucket.acquire()` 會立即拋出 `ValueError`（而非無限等待——後者會表現為程式靜默卡死）。遇到時請檢查 trace 的 `estimate_ready` 分項是否異常，或調高該模型的 `TPM`。
 
 ---
 
@@ -403,6 +500,10 @@ from agent_factory.agent_builder import AgentBuilder
 
 - **Gemini `AQ.` 前綴 API key**：使用 Google AI Studio 新建的 API key 透過 Gemini OpenAI-compatible endpoint 呼叫時，會出現 `400 Multiple authentication credentials received` 錯誤。需改用從 Google Cloud Console 建立的 `AIza` 開頭格式。詳細步驟與驗證程式碼請參見 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。
 
-- **`MODEL_LIMITS` 未涵蓋的模型**：若使用的模型名稱不在 `MODEL_LIMITS` 字典中，速率限制模組在取得 bucket 時會拋出 `KeyError`。請在 `limits_parameters.py` 的 `MODEL_LIMITS` 新增對應設定後再使用。
+- **遠端 URL 影像無法取得尺寸**：`read_image_size()` 只解析 base64 data URL 的 header，遇到 `http(s)` URL 一律回傳 `None`（刻意不發網路請求）。此時影像會以該模型家族的 high-detail 上限計入，屬保守高估。若需精確估算，請改以 data URL 傳入影像。
 
-- **雲端 vision 模型的多模態輸入**：預扣估算會把 base64 影像當成文字整串計數，估算值遠超雲端供應商的實際 TPM 配額，請求會卡死在 TPM 等待階段。目前多模態路徑僅支援本地／無配額的自架模型，詳見 [影像輸入與 TPM 預扣](#影像輸入與-tpm-預扣)。
+- **未涵蓋的供應商走 fallback 估算**：模型名不符合任何估算器前綴時，影像以 `FALLBACK_IMAGE_TOKENS`（3,000）計入並 log warning。對雲端供應商建議自行新增估算器（見〈[為新供應商新增估算器](#為新供應商新增估算器)〉），只需在註冊表加一個 entry；本地模型則因為宣告 `concurrency_only` 後不受 TPM 管制，fallback 值不影響實際行為。
+
+- **僅部分模型經過實測驗證**：`gpt-4o-mini`（tile-based）與 `gpt-4.1-mini`（patch-based）已用真實 API 計費數字驗證。其餘模型的公式依官方文件實作，未逐一實測。供應商的換算規則會隨模型改版變動，若發現預扣量明顯偏離，請依 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) 的排查步驟確認。
+
+- **本地模型無法量測估算誤差**：Ollama 的 OpenAI-compatible endpoint 不回報 usage，框架會走全額退款路徑並記錄一則 error。這是已知行為，非錯誤；宣告 `concurrency_only` 後 TPM 管制本就不適用於本地模型。

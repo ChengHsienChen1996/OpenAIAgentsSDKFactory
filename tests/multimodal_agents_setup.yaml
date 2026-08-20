@@ -1,0 +1,44 @@
+# test/multimodal_agents_setup.yaml
+# 多模態（vision）測試用設定：以 Docker 版 Ollama 提供 OpenAI-compatible endpoint。
+#
+# 前置條件：
+#   docker run -d -p 11434:11434 --name ollama ollama/ollama
+#   docker exec ollama ollama pull <base model>   # 並建立 glm-ocr-optimized:latest
+#
+# 可用環境變數覆寫：
+#   OLLAMA_BASE_URL（預設 http://localhost:11434/v1）
+#   OLLAMA_API_KEY （預設 ollama；Ollama 不驗證，但 AsyncOpenAI 要求非空字串）
+
+# ===========================
+# Base Client Setup
+# ===========================
+ollama: &ollama
+  client:
+    api_key: ${oc.env:OLLAMA_API_KEY, 'ollama'}
+    base_url: ${oc.env:OLLAMA_BASE_URL, 'http://localhost:11434/v1'}
+  params:
+    temperature: 0.0
+
+# ===========================
+# Base Model Setup
+# ===========================
+models:
+  glm-ocr: &model_glm_ocr
+    <<: *ollama
+    model: glm-ocr-optimized:latest
+
+# ===========================
+# Agent Setup
+# ===========================
+agents:
+  multimodal:
+    - ocr_agent:
+        name: OllamaOCRAgent
+        model_instruction:
+          dynamic_prompt: false
+          instruction_file_path: ${__dir__}/prompt_files/ocr_instruction.md
+        model_params:
+          <<: *model_glm_ocr
+          params:
+            temperature: 0.0
+            max_tokens: 4096

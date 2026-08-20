@@ -8,6 +8,9 @@ from agents import Agent
 
 from .config_loader import AgentConfigLoader
 from .agent_builder import AgentBuilder
+from .config_schema import AgentConfig
+from .rate_limiter.limits_parameters import registry as limit_registry
+from .rate_limiter.token_bucket import SOURCE_YAML
 
 load_dotenv()
 
@@ -19,7 +22,25 @@ class AgentFactory:
         self._registry: Dict[str, Agent] = {}
 
         for agent_config in AgentConfigLoader.load_validated(yaml_settings_path):
+            self._register_model_limits(agent_config)
             self._registry[agent_config.name] = AgentBuilder.build(agent_config)
+
+    @staticmethod
+    def _register_model_limits(agent_config: AgentConfig) -> None:
+        """把 agent YAML 宣告的 limits 註冊進全域 limit registry。
+
+        優先序 YAML > MODEL_LIMITS > DEFAULT_POLICY。未宣告 ``limits`` 的 agent
+        完全不觸碰 registry，既有設定的行為因此保持不變。
+        """
+        limits = agent_config.model_params.limits
+        if limits is None:
+            return
+
+        limit_registry.register(
+            agent_config.model_params.model,
+            limits.to_registry_config(),
+            source=SOURCE_YAML,
+        )
 
     def get_agent_by_name(self, name: str) -> Agent:
         """依名稱從 registry 取得 Agent 實例。

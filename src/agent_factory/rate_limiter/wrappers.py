@@ -1,4 +1,4 @@
-import time, asyncio, uuid
+import time, asyncio, logging, uuid, warnings
 
 from functools import wraps
 from collections import defaultdict
@@ -8,16 +8,88 @@ from typing import Any, Dict, Callable, Optional
 from agents import Agent, OpenAIChatCompletionsModel
 from agents.run_context import RunContextWrapper
 
-from .limits_parameters import global_sem, global_rpm_limiter
-from .token_counter import count_tokens
+from .image_tokens import has_image_estimator
+from .limits_parameters import get_global_rpm_limiter, get_global_sem
+from .token_counter import count_tokens, estimate_input_tokens
 from .token_bucket import LimitRegistry
+
+logger = logging.getLogger("rate.guard")
+
+
+def is_version_variant(response_model: str, configured_model: str) -> bool:
+    """判斷供應商回報的模型名是否為設定檔模型的版本變體。
+
+    供應商常回傳帶日期或版本的完整名稱（``gpt-4.1`` → ``gpt-4.1-2025-04-14``），
+    設定檔寫的則是家族名。單純用 ``startswith`` 會誤配：``gpt-4.1-mini`` 也以
+    ``gpt-4.1-`` 開頭，但它是另一個模型、另一套配額，用量絕不能算到 ``gpt-4.1`` 頭上。
+
+    判準：去掉家族名與連字號後，剩餘部分必須以數字開頭（日期或版本號），
+    ``mini`` / ``nano`` 這類變體名以字母開頭因而被排除。
+    """
+    if not response_model or not configured_model:
+        return False
+    if response_model == configured_model:
+        return True
+
+    prefix = configured_model + "-"
+    if not response_model.startswith(prefix):
+        return False
+
+    return response_model[len(prefix):][:1].isdigit()
+
+
+def resolve_actual_usage(
+    configured_model: str,
+    used_by_model: Dict[str, int],
+    total_used: int,
+    model_count: int,
+) -> Optional[int]:
+    """取得該模型的實際 token 用量，三段式比對。
+
+    1. 精確相符：``used_by_model`` 直接有該模型名。
+    2. 版本變體相符：唯一符合的變體才採用，多個符合時視為無法判定。
+    3. 本次呼叫只涉及單一模型：直接採用總量。
+
+    第 3 段是 openai-agents 0.3.3 的實際生效路徑 —— ``ModelResponse`` 只有
+    ``output`` / ``usage`` / ``response_id`` 三個欄位，**沒有** ``model``，
+    因此 ``used_by_model`` 恆為空。前兩段是為了相容未來 SDK 補上該欄位的情況。
+
+    Returns:
+        實際用量；完全無法判定時回傳 None（呼叫端應全額退款）。
+    """
+    if configured_model in used_by_model:
+        return used_by_model[configured_model]
+
+    variants = [
+        name for name in used_by_model if is_version_variant(name, configured_model)
+    ]
+    if len(variants) == 1:
+        return used_by_model[variants[0]]
+
+    if model_count == 1 and total_used > 0:
+        return total_used
+
+    return None
 
 
 def with_global_limits(fn):
+    """已棄用：全域 RPM 與併發限制已內建於 limits_guard_multi 的等待鏈。
+
+    .. deprecated::
+        本裝飾器將於下一個主要版本移除。已套用 ``limits_guard_multi`` 的方法
+        不需要再疊加本裝飾器，那會造成重複的全域節流。
+    """
+    warnings.warn(
+        "with_global_limits 已棄用，全域 RPM 與併發限制已內建於 limits_guard_multi，"
+        "本裝飾器將於下一個主要版本移除。",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
     @wraps(fn)
     async def wrapped(state, *args, **kwargs):
-        async with global_rpm_limiter:
-            async with global_sem:
+        async with get_global_rpm_limiter():
+            async with get_global_sem():
                 return await fn(state, *args, **kwargs)
     return wrapped
 
@@ -78,7 +150,7 @@ def limits_guard_multi(
 ):
     """
     只掛在「實際發 API」的方法上（如呼叫 Runner.run 的 gateway）。
-    等待順序：TPM(umbrella→model) → RPM(model) → Semaphore。
+    等待順序：TPM(umbrella→model) → RPM(model) → RPD(model) → 全域 RPM → Semaphore。
     結束後：按 raw_responses[*].model 逐模型合計 actual，做「低估補扣 / 高估退款」；umbrella 同步校正。
     """
     def deco(fn):
@@ -97,8 +169,17 @@ def limits_guard_multi(
             ctx_obj = kwargs.get(context_arg, None)
             wrapper = RunContextWrapper(context=ctx_obj)
 
-            # 先算 user_tok（不會阻塞）
-            user_tok = count_tokens(str(user_input), model_name)
+            # 先算輸入估算（不會阻塞）。影像由 image_tokens 換算，不做文字計數。
+            estimate = estimate_input_tokens(user_input, model_name)
+            user_tok = estimate.total
+
+            # 有影像卻沒有對應估算器時，估值只能取保守 fallback。在開始等配額之前
+            # 就先示警，讓使用者不必等到請求結束才發現估算不可靠。
+            if estimate.image_count > 0 and not has_image_estimator(model_name):
+                logger.warning(
+                    "image_estimate_unreliable run_id=%s model=%s image_count=%d",
+                    run_id, model_name, estimate.image_count,
+                )
 
             t0 = time.monotonic()
             if trace:
@@ -130,11 +211,18 @@ def limits_guard_multi(
                            )
             models = [model_name]
 
-            # 可選：把目前估值也打一下
+            # 可選：把目前估值也打一下。
+            # text_tok / image_tok / other_tok / image_count 是 Phase 4 量測估算誤差的
+            # 唯一資料來源，欄位名不可隨意更動。
             if trace:
                 trace("estimate_ready", {
                     "run_id": run_id, "reserved_tokens": reserved,
-                    "user_tok": user_tok, "sys_tok": sys_tok
+                    "user_tok": user_tok, "sys_tok": sys_tok,
+                    "text_tok": estimate.text_tokens,
+                    "image_tok": estimate.image_tokens,
+                    "other_tok": estimate.other_tokens,
+                    "image_count": estimate.image_count,
+                    "has_unknown_items": estimate.has_unknown_items,
                 })
 
             # ---- 4) 送出前等待：先 umbrella.TPM，再每模型 TPM，再每模型 RPM，最後併發 ----
@@ -171,9 +259,18 @@ def limits_guard_multi(
                                                             heartbeat_every_s)
                     if trace: trace("acquired", {"run_id": run_id, "stage": "model_rpd", "wait_s": round(wait_rpd, 2)})
 
+                # 全域 RPM（跨模型共用，來自環境變數 RPM）。
+                # 放在併發名額之前、模型層限制之後，與原 with_global_limits 的順序一致。
+                async def _global_rpm():
+                    async with get_global_rpm_limiter():
+                        pass
+                _, wait_grpm, _ = await _wait_with_trace(_global_rpm, trace, run_id, "global_rpm",
+                                                         warn_after_s, heartbeat_every_s)
+                if trace: trace("acquired", {"run_id": run_id, "stage": "global_rpm", "wait_s": round(wait_grpm, 2)})
+
                 # 併發名額（最後拿，拿到就立刻送）
                 async def _sem_and_call():
-                    async with global_sem:
+                    async with get_global_sem():
                         return await fn(self, *args, **kwargs)
 
                 resp, call_time, _ = await _wait_with_trace(lambda: _sem_and_call(), trace, run_id, "inflight_and_call",
@@ -213,12 +310,24 @@ def limits_guard_multi(
 
             # ---- 6) 校正：低估 → 補扣；高估 → 退款（先模型、後 umbrella）----
             for m in models:
-                actual = used_by_model.get(m, 0)
-                if actual > reserved:
+                actual = resolve_actual_usage(m, used_by_model, total_used, len(models))
+
+                if actual is None:
+                    # 取不到任何用量：全額退回預扣，寧可短暫超額也不讓桶被靜默抽乾。
+                    # 用 error 而非 warning —— 這代表 TPM 管制對該供應商實質失效，需人工檢視。
+                    logger.error(
+                        "usage_unavailable_full_refund run_id=%s model=%s reserved=%d "
+                        "raw_responses=%d：無法取得實際用量，本次預扣全額退回，TPM 管制未生效",
+                        run_id, m, reserved, len(raw_list),
+                    )
+                    await registry.bucket(m).refund(reserved)
+                    if trace:
+                        trace("refund_tpm_full", {"run_id": run_id, "model": m, "refund_tokens": reserved})
+                elif actual > reserved:
                     # 低估：補扣差額（必要時會等待）
                     await registry.bucket(m).acquire(actual - reserved)
                     if trace: trace("topup_tpm", {"run_id": run_id, "model": m, "extra_tokens": actual - reserved})
-                elif reserved > actual > 0:
+                elif reserved > actual:
                     # 高估：退款差額
                     await registry.bucket(m).refund(reserved - actual)
                     if trace: trace("refund_tpm", {"run_id": run_id, "model": m, "refund_tokens": reserved - actual})
@@ -227,7 +336,12 @@ def limits_guard_multi(
                 await umbrella.acquire(total_used - reserved)
                 if trace: trace("topup_tpm",
                                 {"run_id": run_id, "model": "umbrella", "extra_tokens": total_used - reserved})
-            elif reserved > total_used > 0:
+            elif total_used <= 0:
+                # 與模型桶一致：完全取不到用量時全額退回，否則 umbrella 也會被慢慢抽乾。
+                await umbrella.refund(reserved)
+                if trace: trace("refund_tpm_full",
+                                {"run_id": run_id, "model": "umbrella", "refund_tokens": reserved})
+            elif reserved > total_used:
                 await umbrella.refund(reserved - total_used)
                 if trace: trace("refund_tpm",
                                 {"run_id": run_id, "model": "umbrella", "refund_tokens": reserved - total_used})
