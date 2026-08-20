@@ -34,19 +34,28 @@ def sample_factory(sample_yaml_path: Path) -> AgentFactory:
 
 
 @pytest.fixture
-def mock_run_result() -> Callable[[Iterable[Tuple[str, int]]], SimpleNamespace]:
+def mock_run_result() -> Callable[..., SimpleNamespace]:
     """回傳一個工廠函式，用來建立模擬的 ``RunResult``。
 
     參數為 ``(model_name, total_tokens)`` 序列，每組產生一筆 raw_response。
-    `limits_guard_multi` 的校正邏輯只讀 ``raw_responses[*].usage.total_tokens``
-    與 ``raw_responses[*].model``，故此處只模擬這兩個屬性。
+
+    ``include_model_name`` 預設為 False，因為 openai-agents 0.3.3 的 ``ModelResponse``
+    只有 ``output`` / ``usage`` / ``response_id`` 三個欄位，**沒有** ``model``。
+    預設值刻意貼合這個現實，否則測試會驗到一個實際不存在的情境。
+    需要驗證「未來 SDK 補上該欄位」的比對路徑時，才傳 True。
     """
 
-    def _make(usages: Iterable[Tuple[str, int]]) -> SimpleNamespace:
-        raw_responses = [
-            SimpleNamespace(model=model, usage=SimpleNamespace(total_tokens=total))
-            for model, total in usages
-        ]
+    def _make(
+        usages: Iterable[Tuple[str, int]],
+        *,
+        include_model_name: bool = False,
+    ) -> SimpleNamespace:
+        raw_responses = []
+        for model, total in usages:
+            raw = SimpleNamespace(usage=SimpleNamespace(total_tokens=total), response_id=None)
+            if include_model_name:
+                raw.model = model
+            raw_responses.append(raw)
         return SimpleNamespace(raw_responses=raw_responses, new_items=[], final_output=None)
 
     return _make

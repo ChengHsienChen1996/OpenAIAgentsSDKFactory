@@ -28,8 +28,10 @@ class AsyncTokenBucket:
                 wait = max(0.05, min(deficit/self.refill if self.refill>0 else 1.0, 2.0))
             await asyncio.sleep(wait)
     async def refund(self, amount: int):
+        # 不可寫成 int(self.tokens) + amount：那會在每次退款時無條件捨去小數部分，
+        # 讓桶內餘額隨呼叫次數持續流失（每次最多 1 token，長時間執行會累積成可觀的缺額）。
         async with self._lock:
-            self.tokens = min(self.capacity, int(self.tokens) + amount)
+            self.tokens = min(self.capacity, self.tokens + amount)
 
 
 class LimitRegistry:
