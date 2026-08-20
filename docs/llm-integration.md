@@ -76,9 +76,30 @@ MODEL_LIMITS = {
 }
 ```
 
-使用未定義在 `MODEL_LIMITS` 中的模型會導致 `KeyError`，需先新增設定。
+每個模型可宣告 `policy` 決定管制方式：
 
-> **本地模型（如 Ollama）特例**：本地推理無雲端費用，速率限制的意義主要在於保護本機資源（VRAM、並發數），而非避免帳單。`MODEL_LIMITS` 的設定方式可依本機能力調整，或改用較寬鬆的設定。
+| 策略 | 說明 | 適用 |
+|------|------|------|
+| `enforced` | 實際管制 TPM/RPM/RPD（未寫 `policy` 時的預設） | 雲端供應商 |
+| `concurrency_only` | 只受全域併發約束，不需填配額數值 | 本地／自架模型 |
+| `unlimited` | 完全不管制 | 特殊情境 |
+
+```python
+MODEL_LIMITS = {
+    "gpt-4.1": {"TPM": 30000, "RPM": 500, "TPD": 90000},
+    "my-local-model": {"policy": "concurrency_only"},
+}
+```
+
+也可在 agent YAML 的 `model_params.limits` 宣告，優先序為 **agent YAML > `MODEL_LIMITS` > `DEFAULT_POLICY`**。
+
+未登錄於任何一處的模型會套用 `DEFAULT_POLICY`（預設 `concurrency_only`），並發出一次警告，不會中斷執行。
+
+> **版本差異**：上述策略機制需模組具備 `LimitPolicy`。較早的版本沒有此機制，使用未定義於 `MODEL_LIMITS` 的模型會直接拋出 `KeyError`，必須先新增設定。引用舊版的專案請以後者為準。
+
+> **本地模型（如 Ollama）特例**：本地推理無雲端費用，速率限制的意義在於保護本機資源而非避免帳單。TPM／RPM 不對應任何真實約束，真正的瓶頸是 GPU 序列化執行，唯一有意義的管制是併發數，因此建議宣告 `{"policy": "concurrency_only"}`——不必為它編造配額數值。
+>
+> 舊版無 policy 機制時的作法是把 `MODEL_LIMITS` 的配額設得足夠寬鬆；但要注意單次預扣量若超過所設的 TPM，舊版會無限等待（表現為靜默卡死），因此該數值必須明顯大於任何單次請求的預扣量。
 
 ## Prompt 管理
 
@@ -98,4 +119,4 @@ LLM API（含本地模型）的測試策略依循 [testing-strategy.md](testing-
 ## 常見問題
 
 - **Gemini API Key 格式問題**：Google AI Studio 產生的 `AQ.` 開頭 key 可能導致 `400 Multiple authentication credentials received`，需改用 Google Cloud Console 產生的 `AIza` 開頭格式。
-- **模型未在 MODEL_LIMITS 中定義**：速率限制模組會拋出 `KeyError`，需先在 `limits_parameters.py` 新增對應設定。
+- **模型未在 MODEL_LIMITS 中定義**：套用 `DEFAULT_POLICY`（預設 `concurrency_only`）並發出一次警告，不會中斷執行。若該模型需要實際管制，請在 `limits_parameters.py` 或 agent YAML 的 `model_params.limits` 補上設定。（舊版行為為拋出 `KeyError`。）
