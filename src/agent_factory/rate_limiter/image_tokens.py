@@ -257,8 +257,19 @@ def _tile_based_tokens(
     文件描述的步驟：(1) 等比縮放至可容於 2048×2048 方框內；(2) 再等比縮放使短邊為 768px；
     (3) 計算涵蓋該影像所需的 512px 方塊數。``detail="low"`` 只計 base tokens，不計方塊。
 
+    **第 (2) 步只縮小、不放大**：文件的措辭「scale so that the image's shortest side is
+    768px long」字面上可解讀為無條件縮放，但實測顯示供應商不會把小圖放大。
+    以 gpt-4o-mini 實測（見 logs/2026-08-20_test_multimodal-estimation-validation.md）：
+
+        256×256   → 實際 8,500 tokens（= base + 1 塊），若放大至 768 則為 4 塊
+        512×512   → 實際 8,500 tokens（= base + 1 塊）
+        1024×1024 → 實際 25,501 tokens（= base + 4 塊，此時確實需縮小）
+        1024×1536 → 實際 36,835 tokens（= base + 6 塊）
+
+    採「只縮小」後四筆實測全部精確吻合；採「無條件縮放」則前兩筆高估 3 倍。
+
     來源：https://developers.openai.com/api/docs/guides/images-vision
-    查閱日期：2026-08-20
+    查閱日期：2026-08-20（縮放方向依 2026-08-20 實測校正）
     """
     if detail == "low":
         return base_tokens
@@ -269,7 +280,8 @@ def _tile_based_tokens(
 
     short_side = min(scaled_width, scaled_height)
     if short_side > 0:
-        short_side_scale = TILE_TARGET_SHORT_SIDE_PX / short_side
+        # min(1.0, ...) 是關鍵：短邊已小於 768 時維持原尺寸，不放大。
+        short_side_scale = min(1.0, TILE_TARGET_SHORT_SIDE_PX / short_side)
         scaled_width *= short_side_scale
         scaled_height *= short_side_scale
 

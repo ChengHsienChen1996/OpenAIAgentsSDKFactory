@@ -214,6 +214,36 @@ def test_tile_based_follows_documented_steps(width, height, expected):
     assert IMAGE_TOKEN_ESTIMATORS["gpt-4o"](width, height, "high") == expected
 
 
+@pytest.mark.parametrize(
+    "width,height,expected",
+    [
+        # 短邊已小於 768，不放大 → 1 塊 → 2833 + 1×5667
+        (256, 256, 8500),
+        (512, 512, 8500),
+        # 短邊 1024 > 768，縮小至 768×768 → 4 塊 → 2833 + 4×5667
+        (1024, 1024, 25501),
+        # 短邊 1024 → 768，得 768×1152 → 2×3 = 6 塊 → 2833 + 6×5667
+        (1024, 1536, 36835),
+    ],
+)
+def test_tile_based_matches_measured_billing(width, height, expected):
+    """期望值取自 gpt-4o-mini 的實際計費，非由文件推導。
+
+    來源：logs/2026-08-20_test_multimodal-estimation-validation.md
+    這組數字是唯一能抓出「短邊縮放方向」讀法錯誤的依據 —— 對照官方文件無法發現，
+    因為文件的措辭對放大與否是有歧義的。
+    """
+    assert IMAGE_TOKEN_ESTIMATORS["gpt-4o-mini"](width, height, "high") == expected
+
+
+def test_tile_based_does_not_upscale_small_images():
+    """小圖不得被放大 —— 放大會讓估值變成實際計費的 3 倍。"""
+    small = IMAGE_TOKEN_ESTIMATORS["gpt-4o"](256, 256, "high")
+    one_tile = 85 + 170
+
+    assert small == one_tile
+
+
 def test_tile_based_low_detail_costs_base_only():
     """detail="low" 只計 base tokens，不論影像多大。"""
     assert IMAGE_TOKEN_ESTIMATORS["gpt-4o"](8000, 8000, "low") == 85
