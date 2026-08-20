@@ -9,7 +9,7 @@ from agents import Agent, OpenAIChatCompletionsModel
 from agents.run_context import RunContextWrapper
 
 from .image_tokens import has_image_estimator
-from .limits_parameters import global_sem, global_rpm_limiter, get_global_rpm_limiter
+from .limits_parameters import get_global_rpm_limiter, get_global_sem
 from .token_counter import count_tokens, estimate_input_tokens
 from .token_bucket import LimitRegistry
 
@@ -88,8 +88,8 @@ def with_global_limits(fn):
 
     @wraps(fn)
     async def wrapped(state, *args, **kwargs):
-        async with global_rpm_limiter:
-            async with global_sem:
+        async with get_global_rpm_limiter():
+            async with get_global_sem():
                 return await fn(state, *args, **kwargs)
     return wrapped
 
@@ -270,7 +270,7 @@ def limits_guard_multi(
 
                 # 併發名額（最後拿，拿到就立刻送）
                 async def _sem_and_call():
-                    async with global_sem:
+                    async with get_global_sem():
                         return await fn(self, *args, **kwargs)
 
                 resp, call_time, _ = await _wait_with_trace(lambda: _sem_and_call(), trace, run_id, "inflight_and_call",

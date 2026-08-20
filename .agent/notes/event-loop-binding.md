@@ -1,7 +1,7 @@
 # 模組層物件與 event loop 綁定問題
 
 日期：2026-08-20
-狀態：**已確認，未修復**。承接自 Phase 3，是否另開 phase 待決。
+狀態：**已依方案 A 修復**（2026-08-20）。修復內容與過程中發現的次生問題見文末〈修復記錄〉。
 
 ---
 
@@ -161,3 +161,70 @@ async def burst(n):
 asyncio.run(burst(GLOBAL_CONCURRENCY + 2))   # loop A：產生競爭並綁定 loop
 asyncio.run(burst(GLOBAL_CONCURRENCY + 2))   # loop B：RuntimeError
 ```
+
+---
+
+## 修復記錄（2026-08-20，方案 A）
+
+### 改動
+
+| 檔案 | 內容 |
+|------|------|
+| `limits_parameters.py` | 新增 `get_global_sem()`（依 loop 建立）、`_drop_closed_loops()`；`global_sem` 與 `global_rpm_limiter` 改由 module `__getattr__` 提供並發出 `DeprecationWarning` |
+| `wrappers.py` | `limits_guard_multi` 與已棄用的 `with_global_limits` 都改用 per-loop 取得函式 |
+| `tests/rate_limiter/test_event_loop_binding.py` | 新增 10 個迴歸測試 |
+
+### 刻意不改的部分
+
+`registry` 內的 `model_rpms` / `model_rpds`（`AsyncLimiter`）**維持共用**。
+
+理由：那些是**供應商配額**。依 loop 分割會讓每個 loop 各拿一份配額，實際請求量變成 N 倍
+而撞 429 —— 對配額型限制器而言，依 loop 分割是比警告噪音更糟的錯誤。
+併發上限則不同，它是本機資源保護而非供應商配額，且真正的配額仍由共用的 token bucket
+與 RPM 限制器把關，因此依 loop 分割是可接受的。
+
+`AsyncTokenBucket` 同樣維持共用（實測從不綁定 loop，且依 loop 重建會使 TPM 餘額歸零）。
+
+### 過程中發現的次生問題：WeakKeyDictionary 洩漏
+
+**單靠 `WeakKeyDictionary` 並不足夠。** `asyncio.Semaphore` 發生競爭後會把 `_loop`
+指回該 loop，`AsyncLimiter` 首次使用後也會保存 `_event_loop`——**value 強參照了 key**，
+弱參照因而永遠不會被觸發。
+
+實測（修正前）：
+
+| 情境 | `sem._loop` | 連續 5 次 `asyncio.run` 後 gc×3 的殘留項目 |
+|------|------------|----------------------------------|
+| 無競爭 | `None` | 0 |
+| **有競爭** | 指回該 loop | **5（全部殘留）** |
+
+也就是說，洩漏正好發生在本機制要處理的情境上。Phase 3 加入的 `_rpm_limiter_by_loop`
+有同樣的問題。
+
+**修法**：`_drop_closed_loops()` 在每次取用時清掉已關閉 loop 的項目。
+修正後連續 20 次帶競爭的 `asyncio.run()`，對照表項目數恆為 1。
+
+> 教訓：`WeakKeyDictionary` 只在「value 不會強參照 key」時才成立。
+> 以 asyncio 同步原語為 value 時這個前提不成立，必須另有主動清理機制。
+
+### 語意變更
+
+多 loop 情境下，全域併發上限變成「每個 loop 各 `GLOBAL_CONCURRENCY` 個」。
+
+單一 loop（絕大多數正式環境）行為完全不變。多 loop 情境在修復前是直接拋 `RuntimeError`，
+本就沒有可保障的語意，因此不算削弱既有保證。
+
+### 舊符號的相容處理
+
+`global_sem` 與 `global_rpm_limiter` 是模組的公開符號，下游可能直接引用，
+直接移除屬破壞性變更（architecture.md 原則 1）。改以 PEP 562 的 module `__getattr__`
+攔截：仍可取用（回傳原本的模組層單例），但會發出 `DeprecationWarning` 提示改用
+對應的 per-loop 函式。本 repo 內部已全數改用新函式，匯入時不會觸發警告。
+
+### 驗證
+
+- 全套測試：**217 passed / 2 deselected**
+- 核心迴歸 `test_contended_semaphore_survives_loop_change`：兩個 loop 各跑併發
+  `GLOBAL_CONCURRENCY + 2`，修復前第二個會拋 `RuntimeError`
+- 併發上限仍生效：`test_semaphore_still_caps_concurrency` 驗證同時進行數不超過上限
+- 洩漏已修：`test_closed_loops_are_not_retained` 與 RPM 版本各一
