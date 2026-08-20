@@ -1,4 +1,4 @@
-import time, asyncio, logging, uuid
+import time, asyncio, logging, uuid, warnings
 
 from functools import wraps
 from collections import defaultdict
@@ -9,7 +9,7 @@ from agents import Agent, OpenAIChatCompletionsModel
 from agents.run_context import RunContextWrapper
 
 from .image_tokens import has_image_estimator
-from .limits_parameters import global_sem, global_rpm_limiter
+from .limits_parameters import global_sem, global_rpm_limiter, get_global_rpm_limiter
 from .token_counter import count_tokens, estimate_input_tokens
 from .token_bucket import LimitRegistry
 
@@ -73,6 +73,19 @@ def resolve_actual_usage(
 
 
 def with_global_limits(fn):
+    """已棄用：全域 RPM 與併發限制已內建於 limits_guard_multi 的等待鏈。
+
+    .. deprecated::
+        本裝飾器將於下一個主要版本移除。已套用 ``limits_guard_multi`` 的方法
+        不需要再疊加本裝飾器，那會造成重複的全域節流。
+    """
+    warnings.warn(
+        "with_global_limits 已棄用，全域 RPM 與併發限制已內建於 limits_guard_multi，"
+        "本裝飾器將於下一個主要版本移除。",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+
     @wraps(fn)
     async def wrapped(state, *args, **kwargs):
         async with global_rpm_limiter:
@@ -137,7 +150,7 @@ def limits_guard_multi(
 ):
     """
     只掛在「實際發 API」的方法上（如呼叫 Runner.run 的 gateway）。
-    等待順序：TPM(umbrella→model) → RPM(model) → Semaphore。
+    等待順序：TPM(umbrella→model) → RPM(model) → RPD(model) → 全域 RPM → Semaphore。
     結束後：按 raw_responses[*].model 逐模型合計 actual，做「低估補扣 / 高估退款」；umbrella 同步校正。
     """
     def deco(fn):
@@ -245,6 +258,15 @@ def limits_guard_multi(
                     _, wait_rpd, _ = await _wait_with_trace(_rpd_acq, trace, run_id, "model_rpd", warn_after_s,
                                                             heartbeat_every_s)
                     if trace: trace("acquired", {"run_id": run_id, "stage": "model_rpd", "wait_s": round(wait_rpd, 2)})
+
+                # 全域 RPM（跨模型共用，來自環境變數 RPM）。
+                # 放在併發名額之前、模型層限制之後，與原 with_global_limits 的順序一致。
+                async def _global_rpm():
+                    async with get_global_rpm_limiter():
+                        pass
+                _, wait_grpm, _ = await _wait_with_trace(_global_rpm, trace, run_id, "global_rpm",
+                                                         warn_after_s, heartbeat_every_s)
+                if trace: trace("acquired", {"run_id": run_id, "stage": "global_rpm", "wait_s": round(wait_grpm, 2)})
 
                 # 併發名額（最後拿，拿到就立刻送）
                 async def _sem_and_call():

@@ -252,12 +252,23 @@ async def test_text_only_input_reports_zero_images(result):
 
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
-async def test_wait_order_events_unchanged(result):
-    """等待順序不得因本次改動而變動。"""
+async def test_wait_order(result):
+    """等待順序：模型層限制 → 全域 RPM → 併發名額。
+
+    Phase 3 依使用者指示，把原本只存在於已棄用 with_global_limits 裡的全域 RPM
+    接進本等待鏈（先前環境變數 RPM 對實際請求毫無作用）。global_rpm 的位置
+    比照原 with_global_limits：模型層限制之後、併發名額之前。
+    """
     events = []
     runner = _build_runner(events, result)
 
     await runner.run(input_="hi")
 
     stages = [f.get("stage") for name, f in events if name == "acquired"]
-    assert stages == ["build_system", "umbrella_tpm", f"model_tpm:{TEST_MODEL}", "model_rpm_chain"]
+    assert stages == [
+        "build_system",
+        "umbrella_tpm",
+        f"model_tpm:{TEST_MODEL}",
+        "model_rpm_chain",
+        "global_rpm",
+    ]
