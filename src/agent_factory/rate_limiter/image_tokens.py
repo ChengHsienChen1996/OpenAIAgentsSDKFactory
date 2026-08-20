@@ -451,6 +451,14 @@ def _match_prefix(model_name: str) -> Optional[str]:
     return max(matches, key=len)
 
 
+def has_image_estimator(model_name: str) -> bool:
+    """該模型是否有對應的影像估算器。
+
+    供呼叫端在開始等待配額前就判斷估算是否可靠（無估算器時只能取 FALLBACK_IMAGE_TOKENS）。
+    """
+    return _match_prefix(model_name) is not None
+
+
 def estimate_image_tokens(image_url: str, model_name: str, detail: str = "auto") -> int:
     """估算單張影像的 token 成本。
 

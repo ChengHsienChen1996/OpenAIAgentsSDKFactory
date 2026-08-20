@@ -1,4 +1,4 @@
-import time, asyncio, uuid
+import time, asyncio, logging, uuid
 
 from functools import wraps
 from collections import defaultdict
@@ -8,9 +8,12 @@ from typing import Any, Dict, Callable, Optional
 from agents import Agent, OpenAIChatCompletionsModel
 from agents.run_context import RunContextWrapper
 
+from .image_tokens import has_image_estimator
 from .limits_parameters import global_sem, global_rpm_limiter
-from .token_counter import count_tokens
+from .token_counter import count_tokens, estimate_input_tokens
 from .token_bucket import LimitRegistry
+
+logger = logging.getLogger("rate.guard")
 
 
 def with_global_limits(fn):
@@ -97,8 +100,17 @@ def limits_guard_multi(
             ctx_obj = kwargs.get(context_arg, None)
             wrapper = RunContextWrapper(context=ctx_obj)
 
-            # 先算 user_tok（不會阻塞）
-            user_tok = count_tokens(str(user_input), model_name)
+            # 先算輸入估算（不會阻塞）。影像由 image_tokens 換算，不做文字計數。
+            estimate = estimate_input_tokens(user_input, model_name)
+            user_tok = estimate.total
+
+            # 有影像卻沒有對應估算器時，估值只能取保守 fallback。在開始等配額之前
+            # 就先示警，讓使用者不必等到請求結束才發現估算不可靠。
+            if estimate.image_count > 0 and not has_image_estimator(model_name):
+                logger.warning(
+                    "image_estimate_unreliable run_id=%s model=%s image_count=%d",
+                    run_id, model_name, estimate.image_count,
+                )
 
             t0 = time.monotonic()
             if trace:
@@ -130,11 +142,18 @@ def limits_guard_multi(
                            )
             models = [model_name]
 
-            # 可選：把目前估值也打一下
+            # 可選：把目前估值也打一下。
+            # text_tok / image_tok / other_tok / image_count 是 Phase 4 量測估算誤差的
+            # 唯一資料來源，欄位名不可隨意更動。
             if trace:
                 trace("estimate_ready", {
                     "run_id": run_id, "reserved_tokens": reserved,
-                    "user_tok": user_tok, "sys_tok": sys_tok
+                    "user_tok": user_tok, "sys_tok": sys_tok,
+                    "text_tok": estimate.text_tokens,
+                    "image_tok": estimate.image_tokens,
+                    "other_tok": estimate.other_tokens,
+                    "image_count": estimate.image_count,
+                    "has_unknown_items": estimate.has_unknown_items,
                 })
 
             # ---- 4) 送出前等待：先 umbrella.TPM，再每模型 TPM，再每模型 RPM，最後併發 ----
