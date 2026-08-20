@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from pydantic import BaseModel, model_validator
 
@@ -28,10 +28,46 @@ class InstructionConfig(BaseModel):
         return self
 
 
+class ModelLimitsConfig(BaseModel):
+    """單一模型的速率限制宣告。
+
+    優先序高於 ``limits_parameters.MODEL_LIMITS``：同一模型若兩處都有設定，以本處為準。
+    """
+
+    policy: Literal["enforced", "concurrency_only", "unlimited"] = "enforced"
+    TPM: Optional[int] = None
+    RPM: Optional[int] = None
+    RPD: Optional[int] = None
+
+    @model_validator(mode="after")
+    def require_quota_for_enforced(self) -> ModelLimitsConfig:
+        """``policy="enforced"`` 時 TPM 與 RPM 為必填 —— 沒有數值就無從管制。"""
+        if self.policy != "enforced":
+            return self
+
+        missing = [field for field in ("TPM", "RPM") if getattr(self, field) is None]
+        if missing:
+            raise ValueError(
+                f'policy="enforced" 時以下欄位為必填：{", ".join(missing)}'
+                "（若為本地／自架模型，請改用 policy=concurrency_only）"
+            )
+        return self
+
+    def to_registry_config(self) -> Dict[str, Any]:
+        """轉為 ``LimitRegistry.register()`` 接受的設定 dict。"""
+        cfg: Dict[str, Any] = {"policy": self.policy}
+        for field in ("TPM", "RPM", "RPD"):
+            value = getattr(self, field)
+            if value is not None:
+                cfg[field] = value
+        return cfg
+
+
 class ModelParamsConfig(BaseModel):
     model: str
     client: Dict[str, Any] = {}
     params: Dict[str, Any] = {}
+    limits: Optional[ModelLimitsConfig] = None
 
     @model_validator(mode="after")
     def validate_client_fields(self) -> ModelParamsConfig:

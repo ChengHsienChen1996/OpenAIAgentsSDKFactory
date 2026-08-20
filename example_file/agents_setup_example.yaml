@@ -28,6 +28,16 @@ models:
     <<: *openai
     model: gpt-4.1
 
+  # 本地／自架模型：本地推理無帳單，TPM/RPM 不對應任何真實約束，
+  # 唯一有意義的管制是併發數，故宣告 concurrency_only（不需填 TPM/RPM）。
+  local-ocr: &model_local_ocr
+    client:
+      api_key: ${oc.env:OLLAMA_API_KEY, 'ollama'}
+      base_url: ${oc.env:OLLAMA_BASE_URL, 'http://localhost:11434/v1'}
+    model: glm-ocr-optimized:latest
+    limits:
+      policy: concurrency_only
+
 # ===========================
 # Agent Setup (單一範例)
 # ===========================
@@ -43,4 +53,22 @@ agents:
           <<: *model_gpt41
           params:
             temperature: 0.3
+          # 選填。未宣告 limits 時沿用 limits_parameters.MODEL_LIMITS；
+          # 兩處都沒有時依 DEFAULT_POLICY（預設 concurrency_only）。
+          limits:
+            policy: enforced        # enforced 時 TPM 與 RPM 為必填
+            TPM: 30000
+            RPM: 500
+            RPD: 1500               # 選填，Free Tier 供應商才需要
         output_schema: schema.model_output.example_schema.ExampleOutput
+
+    # 本地模型範例：不需填任何配額數值
+    - local_ocr_agent:
+        name: LocalOCRAgent
+        model_instruction:
+          dynamic_prompt: false
+          instruction_file_path: ${__dir__}/prompt_files/example_instruction.md
+        model_params:
+          <<: *model_local_ocr
+          params:
+            temperature: 0.0

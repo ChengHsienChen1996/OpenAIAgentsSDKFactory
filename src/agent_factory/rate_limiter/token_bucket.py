@@ -88,6 +88,12 @@ class NullLimiter:
 _NULL_BUCKET = NullTokenBucket()
 _NULL_LIMITER = NullLimiter()
 
+# 限制設定的來源，數字越大優先序越高。
+SOURCE_MODEL_LIMITS = "model_limits"
+SOURCE_YAML = "yaml"
+
+_SOURCE_PRIORITY = {SOURCE_MODEL_LIMITS: 0, SOURCE_YAML: 1}
+
 
 class LimitRegistry:
     """依模型的 policy 建立對應限制器。
@@ -113,16 +119,52 @@ class LimitRegistry:
         # 記錄已經警告過的模型名，讓每個未登錄模型只洗一次版面。
         self._warned_models: set = set()
 
+        # model -> (來源, 正規化後的設定)，供衝突判定與冪等檢查使用。
+        self._registered: Dict[str, tuple] = {}
+
         for model, cfg in model_limits.items():
             self.register(model, cfg)
 
-    def register(self, model: str, cfg: Dict[str, Any]) -> None:
+    def register(self, model: str, cfg: Dict[str, Any], *, source: str = SOURCE_MODEL_LIMITS) -> None:
         """登錄單一模型的限制設定。
+
+        registry 為模組層全域單例，同一模型可能被多次註冊（多個 agent、多個工廠實例、
+        重複初始化）。衝突處理規則：
+
+        - **設定相同**：直接返回，重複註冊為冪等操作，不報錯也不重建限制器。
+          重建會把桶內既有餘額歸零，等同於靜默清空配額。
+        - **設定不同、來源優先序較高**（YAML > MODEL_LIMITS）：覆寫並 log info。
+        - **設定不同、來源優先序相同或較低**：保留先前設定並 log warning，不做合併 ——
+          合併兩組不同的配額會產生沒有人宣告過的隱性行為。
 
         Args:
             model: 模型名稱。
             cfg: 限制設定。未指定 ``policy`` 時視為 ``enforced``（維持既有 MODEL_LIMITS 的語意）。
+            source: 設定來源，決定衝突時誰勝出。
         """
+        normalized = self._normalize_cfg(cfg)
+        previous = self._registered.get(model)
+
+        if previous is not None:
+            previous_source, previous_cfg = previous
+
+            if previous_cfg == normalized:
+                return  # 冪等：設定完全相同，不重建限制器
+
+            if _SOURCE_PRIORITY.get(source, 0) > _SOURCE_PRIORITY.get(previous_source, 0):
+                logger.info(
+                    "limits_overridden model=%s from=%s to=%s",
+                    model, previous_source, source,
+                )
+            else:
+                logger.warning(
+                    "limits_conflict model=%s existing_source=%s ignored_source=%s："
+                    "同一模型被宣告了兩組不同的限制設定，以先註冊的為準，不做合併",
+                    model, previous_source, source,
+                )
+                return
+
+        self._registered[model] = (source, normalized)
         policy = LimitPolicy(cfg.get("policy", LimitPolicy.ENFORCED))
         self.model_policies[model] = policy
 
@@ -139,6 +181,20 @@ class LimitRegistry:
 
         if "RPD" in cfg and cfg["RPD"] is not None:  # 可選，有才建立
             self.model_rpds[model] = AsyncLimiter(int(cfg["RPD"]), time_period=86400)
+
+    @staticmethod
+    def _normalize_cfg(cfg: Dict[str, Any]) -> tuple:
+        """把設定 dict 正規化為可比較的形式，供冪等判定使用。
+
+        鍵順序不同、policy 寫明或省略、RPD 為 None 或缺席，都應視為同一組設定。
+        """
+        policy = LimitPolicy(cfg.get("policy", LimitPolicy.ENFORCED)).value
+        quotas = tuple(
+            (key, int(cfg[key]))
+            for key in ("TPM", "RPM", "RPD")
+            if cfg.get(key) is not None
+        )
+        return (policy, quotas)
 
     def policy(self, model: str) -> LimitPolicy:
         """取得該模型實際套用的策略（未登錄時為 default_policy）。"""
